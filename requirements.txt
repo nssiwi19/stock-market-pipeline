@@ -5,3 +5,4 @@ python-dotenv
 requests
 SQLAlchemy
 psycopg2-binary
+plotly
