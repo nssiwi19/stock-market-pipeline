@@ -1,0 +1,52 @@
+name: Daily Stock Pipeline
+
+on:
+  # Tự động chạy hằng ngày
+  schedule:
+    # 08:30 UTC = 15:30 Giờ Việt Nam (sau khi thị trường chứng khoán đóng cửa)
+    # Chạy từ thứ 2 đến thứ 6 (Thị trường mở cửa)
+    - cron: '30 8 * * 1-5'
+  
+  # Cho phép kích hoạt chạy bằng tay (Manual trigger) từ GitHub repo
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # cache dependencies
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Ticker Update (Sync list just in case of new listings)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scripts/fetch_tickers.py
+
+      - name: Run Daily Price Pipeline (OHLCV)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scripts/fetch_historical_prices.py
+
+      # Giai đoạn sau có thể thêm script kéo báo cáo tài chính
+      # - name: Run Financials Pipeline (Quarterly)
+      #   env:
+      #     SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      #     SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      #   run: python scripts/fetch_financials.py
+
+      - name: Summary
+        run: echo "Daily pipeline executed successfully!"

@@ -1,0 +1,7 @@
+vnstock==0.2.8.2
+supabase
+pandas
+python-dotenv
+requests
+SQLAlchemy
+psycopg2-binary
