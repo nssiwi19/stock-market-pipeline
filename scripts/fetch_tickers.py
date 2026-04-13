@@ -1,32 +1,26 @@
 import pandas as pd
-from vnstock import Listing
+from vnstock import listing_companies
 from config import get_supabase_client
-
-# Note: We filter for HOSE and HNX. UPCOM can be added if needed.
-# vnstock's Listing module is used here. For v3.x, Listing.all_symbols() is common.
-# If using an older version, the functions might be slightly different. We assume v3+ syntax based on recent docs.
 
 def fetch_and_store_tickers():
     print("Fetching active tickers from the market...")
     try:
-        # Get all symbols
-        df_symbols = Listing.all_symbols()
+        # Get all symbols using old API
+        df_symbols = listing_companies()
         
-        # Filter for HOSE and HNX
+        # In old vnstock, exchange column is 'comGroupCode'
         target_exchanges = ['HOSE', 'HNX']
-        df_filtered = df_symbols[df_symbols['exchange'].isin(target_exchanges)]
-        
-        # Select and rename columns to match our database schema
-        # In vnstock, common columns are 'ticker', 'exchange', 'industry_en', 'company_name'
-        # We handle potential schema differences gracefully
+        if 'comGroupCode' in df_symbols.columns:
+            df_filtered = df_symbols[df_symbols['comGroupCode'].isin(target_exchanges)]
+        else:
+            df_filtered = df_symbols # fallback if API changed
         
         records_to_insert = []
         for index, row in df_filtered.iterrows():
-            # Handle potential None or missing columns
             ticker = row.get('ticker')
-            exchange = row.get('exchange')
-            industry = row.get('industry', 'N/A') # fallback
-            company_name = row.get('company_name', row.get('short_name', 'N/A'))
+            exchange = row.get('comGroupCode', 'UNKNOWN')
+            industry = row.get('icbName3', 'N/A') 
+            company_name = row.get('organName', row.get('organShortName', 'N/A'))
             
             records_to_insert.append({
                 "ticker": ticker,
