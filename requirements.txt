@@ -6,3 +6,4 @@ requests
 SQLAlchemy
 psycopg2-binary
 plotly
+beautifulsoup4
