@@ -1,4 +1,10 @@
-from config import get_supabase_client
+import sys
+import os
+
+# Ensure the root directory is in sys.path so we can import etl.config
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from etl.config import get_supabase_client
 
 def check_tables():
     supabase = get_supabase_client()

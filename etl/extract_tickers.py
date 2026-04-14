@@ -1,6 +1,6 @@
 import pandas as pd
-from vnstock import listing_companies # Sửa lại import
-from config import get_supabase_client
+from vnstock import listing_companies 
+from .config import get_supabase_client
 
 def fetch_and_store_tickers():
     print("Fetching active tickers from the market...")

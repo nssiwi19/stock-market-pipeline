@@ -8,10 +8,10 @@ import sys
 import os
 import traceback
 from datetime import datetime
-
-import extract_tickers
-import extract_daily_prices
-import config
+from etl import extract_financials
+from etl import extract_tickers
+from etl import extract_daily_prices
+from etl import config
 
 def run_step(step_name, func, *args, **kwargs):
     """Chạy một bước của pipeline và bắt lỗi."""

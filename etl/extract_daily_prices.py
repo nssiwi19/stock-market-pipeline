@@ -1,7 +1,7 @@
 import datetime
 import pandas as pd
-from vnstock import stock_historical_data # Sửa lại import
-from config import get_supabase_client
+from vnstock import stock_historical_data
+from .config import get_supabase_client
 import time
 
 START_DATE = "2025-01-01"
@@ -24,7 +24,7 @@ def fetch_and_store_daily_prices():
                 start_date=START_DATE, 
                 end_date=end_date, 
                 resolution='1D',
-                type='stock' # Thêm type cho chắc chắn
+                type='stock' 
             )
             
             if df is None or df.empty:
@@ -44,7 +44,7 @@ def fetch_and_store_daily_prices():
                  records.append(record)
                  
             if records:
-                supabase.table("daily_prices").upsert(records).execute()
+                supabase.table("daily_prices").upsert(records, on_conflict="ticker,trading_date").execute()
                 print(f"  Upserted data for {ticker}.")
             
             time.sleep(0.5) # Tránh bị rate limit
@@ -53,3 +53,6 @@ def fetch_and_store_daily_prices():
             print(f"  Error processing {ticker}: {e}")
             
     return True
+
+if __name__ == "__main__":
+    fetch_and_store_daily_prices()

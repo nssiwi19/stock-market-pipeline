@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 # Load environment variables from .env file
+# When running from the root, it will find the .env file.
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
