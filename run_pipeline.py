@@ -12,6 +12,7 @@ from etl import extract_financials
 from etl import extract_tickers
 from etl import extract_daily_prices
 from etl import config
+from etl import notifier
 
 def run_step(step_name, func, *args, **kwargs):
     """Chạy một bước của pipeline và bắt lỗi."""
@@ -65,7 +66,9 @@ def main():
     results["Extract Tickers"] = success
 
     if not success:
-        print("\n🛑 Pipeline dừng lại: Extract Tickers thất bại.")
+        error_msg = "❌ Pipeline dừng lại: Extract Tickers thất bại."
+        print(f"\n{error_msg}")
+        notifier.send_telegram_msg(f"🚨 *Stock Pipeline Alert*\n{error_msg}")
         sys.exit(1)
 
     # Bước 2: Extract Daily Prices
@@ -76,7 +79,9 @@ def main():
     results["Extract Daily Prices"] = success
 
     if not success:
-        print("\n🛑 Pipeline dừng lại: Extract Daily Prices thất bại.")
+        error_msg = "❌ Pipeline dừng lại: Extract Daily Prices thất bại."
+        print(f"\n{error_msg}")
+        notifier.send_telegram_msg(f"🚨 *Stock Pipeline Alert*\n{error_msg}")
         sys.exit(1)
 
     # Tổng kết
@@ -94,9 +99,16 @@ def main():
     print(f"   🕐 Kết thúc: {datetime.now(vn_tz).strftime('%Y-%m-%d %H:%M:%S')}")
 
     if all(results.values()):
+        status_msg = "🎉 *PIPELINE CHẠY THÀNH CÔNG!*\n"
+        status_msg += f"- Thời gian: {total_duration:.1f}s\n"
+        status_msg += "- Tickers: ✅\n"
+        status_msg += "- Prices: ✅"
+        
         print("\n   🎉 PIPELINE CHẠY THÀNH CÔNG!")
+        notifier.send_telegram_msg(f"📈 *Stock Pipeline Status*\n{status_msg}")
     else:
         print("\n   ⚠️  Pipeline có lỗi. Kiểm tra log ở trên.")
+        notifier.send_telegram_msg("⚠️ *Stock Pipeline Warning*\nPipeline kết thúc với một số lỗi. Kiểm tra log.")
         sys.exit(1)
 
 if __name__ == "__main__":
