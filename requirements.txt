@@ -7,3 +7,5 @@ SQLAlchemy
 psycopg2-binary
 plotly
 beautifulsoup4
+matplotlib
+seaborn
