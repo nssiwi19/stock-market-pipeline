@@ -2,8 +2,8 @@ name: Daily Stock Market Pipeline
 
 on:
   schedule:
-    # 08:30 UTC = 15:30 (3:30 PM) Vietnam Time (Ngay sau khi thị trường đóng cửa)
-    - cron: '30 8 * * 1-5' 
+    # Chạy lúc 18:00 VN (11:00 UTC) để đảm bảo dữ liệu thị trường đã chốt xong
+    - cron: '0 11 * * 1-5' 
   workflow_dispatch: # Cho phép bấm Run thủ công
 
 jobs:
@@ -29,5 +29,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python run_pipeline.py
