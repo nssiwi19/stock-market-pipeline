@@ -35,69 +35,68 @@ def send_telegram_msg(message):
         print(f"❌ Lỗi kết nối Telegram: {e}")
         return False
 
-def send_telegram_report_with_chart(df_top, summary_text):
-    """
-    Vẽ biểu đồ và gửi kèm ảnh qua Telegram
-    df_top: DataFrame chứa 'ticker' và 'price_change'
-    summary_text: Nội dung caption
-    """
+def send_telegram_report_with_chart(df, message):
+    """Hàm vẽ biểu đồ Top 5 biến động và gửi ảnh qua Telegram"""
     if not TOKEN or not CHAT_ID:
-        print("⚠️ Bỏ qua gửi Telegram Chart vì chưa cấu hình TOKEN hoặc CHAT_ID.")
+        print("⚠️ Bỏ qua gửi Telegram vì chưa cấu hình TOKEN hoặc CHAT_ID.")
         return False
-
+        
     try:
-        # 1. Cấu hình Matplotlib Backend (không dùng giao diện)
-        matplotlib.use('Agg')
-        sns.set_theme(style="whitegrid")
+        # 1. Tiền xử lý dữ liệu (Lấy 5 mã có khối lượng giao dịch lớn nhất)
+        top_5 = df.nlargest(5, 'volume')
         
-        # 2. Vẽ biểu đồ
+        # 2. Vẽ biểu đồ Bar Chart với Seaborn
+        matplotlib.use('Agg') # Đảm bảo chạy được trên server (non-GUI)
+        sns.set_theme(style="darkgrid", palette="muted")
         plt.figure(figsize=(10, 6))
-        colors = ['#2ecc71' if x > 0 else '#e74c3c' for x in df_top['price_change']]
         
-        ax = sns.barplot(x='ticker', y='price_change', data=df_top, palette=colors, hue='ticker', legend=False)
+        # Vẽ Barplot
+        ax = sns.barplot(x='ticker', y='close_price', data=top_5, hue='ticker', palette='viridis', legend=False)
         
-        plt.title("Top 5 Biến động mạnh nhất phiên", fontsize=16, fontweight='bold', pad=20)
-        plt.ylabel("% Thay đổi", fontsize=12)
-        plt.xlabel("Mã chứng khoán", fontsize=12)
+        plt.title('Top 5 Cổ Phiếu Thanh Khoản Nhất Hôm Nay', fontsize=16, fontweight='bold', pad=20)
+        plt.ylabel('Giá Đóng Cửa (VND)', fontsize=12)
+        plt.xlabel('Mã Chứng Khoán', fontsize=12)
         
-        # Thêm nhãn giá trị trên đầu cột
+        # Thêm nhãn giá trị trên từng cột
         for p in ax.patches:
-            ax.annotate(f"{p.get_height():.2f}%", 
-                        (p.get_x() + p.get_width() / 2., p.get_height()), 
-                        ha='center', va='center', 
-                        xytext=(0, 9), 
+            yval = p.get_height()
+            ax.annotate(f'{int(yval):,}', 
+                        (p.get_x() + p.get_width() / 2., yval), 
+                        ha='center', va='bottom', 
+                        xytext=(0, 5), 
                         textcoords='offset points',
                         fontsize=10, fontweight='bold')
-
+        
         plt.tight_layout()
-
-        # 3. Chuyển biểu đồ vào bộ nhớ đệm (Buffer)
+        
+        # 3. Lưu biểu đồ vào bộ nhớ đệm (không tạo file rác trên ổ cứng)
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=300)
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
         buf.seek(0)
         plt.close()
-
-        # 4. Gửi qua Telegram API (sendPhoto)
+        
+        # 4. Gửi ảnh qua Telegram (sendPhoto)
         url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
         files = {'photo': ('chart.png', buf, 'image/png')}
         data = {
             'chat_id': CHAT_ID, 
-            'caption': summary_text, 
+            'caption': message, 
             'parse_mode': 'Markdown'
         }
         
         response = requests.post(url, data=data, files=files, timeout=20)
         
         if response.status_code == 200:
-            print("📸 Đã gửi báo cáo kèm biểu đồ thành công!")
+            print("🖼️ Đã gửi biểu đồ qua Telegram thành công!")
             return True
         else:
-            print(f"❌ Lỗi gửi Telegram Chart: {response.text}")
+            print(f"❌ Lỗi gửi ảnh Telegram: {response.text}")
             return False
-
+            
     except Exception as e:
-        print(f"❌ Lỗi xử lý biểu đồ/Telegram: {e}")
+        print(f"❌ Lỗi khi vẽ/gửi biểu đồ: {e}")
         return False
+
 
 if __name__ == "__main__":
     # Test message

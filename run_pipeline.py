@@ -13,6 +13,8 @@ from etl import extract_tickers
 from etl import extract_daily_prices
 from etl import config
 from etl import notifier
+import pandas as pd
+
 
 def run_step(step_name, func, *args, **kwargs):
     """Chạy một bước của pipeline và bắt lỗi."""
@@ -99,14 +101,38 @@ def main():
     print(f"   🕐 Kết thúc: {datetime.now(vn_tz).strftime('%Y-%m-%d %H:%M:%S')}")
 
     if all(results.values()):
-        status_msg = "🎉 *PIPELINE CHẠY THÀNH CÔNG!*\n"
-        status_msg += f"- Thời gian: {total_duration:.1f}s\n"
-        status_msg += "- Tickers: ✅\n"
-        status_msg += "- Prices: ✅"
-        
         print("\n   🎉 PIPELINE CHẠY THÀNH CÔNG!")
-        notifier.send_telegram_msg(f"📈 *Stock Pipeline Status*\n{status_msg}")
+        
+        try:
+            # Lấy dữ liệu Top 5 thanh khoản hôm nay từ Supabase
+            client = config.get_supabase_client()
+            today_str = datetime.now(vn_tz).strftime('%Y-%m-%d')
+            
+            response = client.table('daily_prices')\
+                .select('ticker, close_price, volume')\
+                .eq('trading_date', today_str)\
+                .order('volume', desc=True)\
+                .limit(5).execute()
+
+            if response.data and len(response.data) > 0:
+                df_top = pd.DataFrame(response.data)
+                
+                msg = f"✅ *BÁO CÁO THỊ TRƯỜNG {datetime.now(vn_tz).strftime('%d/%m/%Y')}*\n"
+                msg += f"⏱️ Thời gian chạy: {total_duration:.1f}s\n"
+                msg += "🔥 *Dòng tiền đang tập trung vào:* " + ", ".join(df_top['ticker'].tolist())
+                
+                # Gửi báo cáo kèm biểu đồ
+                notifier.send_telegram_report_with_chart(df_top, msg)
+            else:
+                # Nếu không có dữ liệu hôm nay (ví dụ chưa cào xong hoặc ngày lễ)
+                status_msg = f"🎉 *PIPELINE CHẠY THÀNH CÔNG!*\n- Thời gian: {total_duration:.1f}s\n- Lưu ý: Không có dữ liệu giao dịch mới để vẽ biểu đồ."
+                notifier.send_telegram_msg(status_msg)
+                
+        except Exception as e:
+            print(f"❌ Lỗi khi tạo báo cáo biểu đồ: {e}")
+            notifier.send_telegram_msg(f"✅ *PIPELINE THÀNH CÔNG*\n⏱️ Tổng thời gian: {total_duration:.1f}s\n(Lỗi tạo biểu đồ: {e})")
     else:
+
         print("\n   ⚠️  Pipeline có lỗi. Kiểm tra log ở trên.")
         notifier.send_telegram_msg("⚠️ *Stock Pipeline Warning*\nPipeline kết thúc với một số lỗi. Kiểm tra log.")
         sys.exit(1)
