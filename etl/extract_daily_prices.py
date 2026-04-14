@@ -1,10 +1,8 @@
-import datetime
 import pandas as pd
 from vnstock import stock_historical_data
 from .config import get_supabase_client
 import time
-
-START_DATE = "2025-01-01"
+from datetime import datetime, timedelta, timezone # Thêm dòng import timezone
 
 def fetch_and_store_daily_prices():
     supabase = get_supabase_client()
@@ -14,14 +12,18 @@ def fetch_and_store_daily_prices():
     response = supabase.table("tickers").select("ticker").execute()
     tickers = [item['ticker'] for item in response.data]
 
-    end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    # --- ĐOẠN CẦN SỬA: Xử lý múi giờ và Incremental Load ---
+    vn_tz = timezone(timedelta(hours=7))
+    end_date = datetime.now(vn_tz).strftime("%Y-%m-%d")
+    start_date = (datetime.now(vn_tz) - timedelta(days=5)).strftime("%Y-%m-%d")
+    # --------------------------------------------------------
 
     for i, ticker in enumerate(tickers):
         try:
-            # Sử dụng stock_historical_data thay cho Trading.historical_data
+            # Sử dụng stock_historical_data
             df = stock_historical_data(
                 symbol=ticker, 
-                start_date=START_DATE, 
+                start_date=start_date, # Sử dụng start_date mới (5 ngày gần nhất)
                 end_date=end_date, 
                 resolution='1D',
                 type='stock' 
@@ -44,8 +46,9 @@ def fetch_and_store_daily_prices():
                  records.append(record)
                  
             if records:
+                # Upsert với on_conflict để tránh trùng lặp ngày/mã
                 supabase.table("daily_prices").upsert(records, on_conflict="ticker,trading_date").execute()
-                print(f"  Upserted data for {ticker}.")
+                print(f"  Upserted data for {ticker} from {start_date} to {end_date}.")
             
             time.sleep(0.5) # Tránh bị rate limit
 

@@ -2,8 +2,8 @@ name: Daily Stock Market Pipeline
 
 on:
   schedule:
-    # 09:00 UTC = 16:00 (4 PM) Vietnam Time (Sau khi đóng cửa phiên chứng khoán, dữ liệu ổn định)
-    - cron: '0 9 * * 1-5' 
+    # 08:30 UTC = 15:30 (3:30 PM) Vietnam Time (Ngay sau khi thị trường đóng cửa)
+    - cron: '30 8 * * 1-5' 
   workflow_dispatch: # Cho phép bấm Run thủ công
 
 jobs:

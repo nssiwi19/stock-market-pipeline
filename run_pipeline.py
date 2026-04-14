@@ -7,7 +7,7 @@ Extract Tickers -> Extract Daily Prices
 import sys
 import os
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from etl import extract_financials
 from etl import extract_tickers
 from etl import extract_daily_prices
@@ -19,25 +19,27 @@ def run_step(step_name, func, *args, **kwargs):
     print(f"🔄 ĐANG CHẠY: {step_name}")
     print(f"{'='*60}\n")
 
-    start = datetime.now()
+    vn_tz = timezone(timedelta(hours=7))
+    start = datetime.now(vn_tz)
 
     try:
         # Chạy hàm thực thi của module
         result = func(*args, **kwargs)
 
-        duration = (datetime.now() - start).total_seconds()
+        duration = (datetime.now(vn_tz) - start).total_seconds()
         print(f"\n✅ {step_name} hoàn tất ({duration:.1f}s)")
         return True, result
 
     except Exception as e:
-        duration = (datetime.now() - start).total_seconds()
+        duration = (datetime.now(vn_tz) - start).total_seconds()
         print(f"\n❌ {step_name} THẤT BẠI sau {duration:.1f}s")
         print(f"   Lỗi: {e}")
         traceback.print_exc()
         return False, None
 
 def main():
-    start_time = datetime.now()
+    vn_tz = timezone(timedelta(hours=7))
+    start_time = datetime.now(vn_tz)
 
     print("╔" + "═"*58 + "╗")
     print("║   📈  STOCK MARKET PIPELINE — Automated Run            ║")
@@ -78,7 +80,7 @@ def main():
         sys.exit(1)
 
     # Tổng kết
-    total_duration = (datetime.now() - start_time).total_seconds()
+    total_duration = (datetime.now(vn_tz) - start_time).total_seconds()
 
     print("\n" + "╔" + "═"*58 + "╗")
     print("║   📊  BÁO CÁO PIPELINE                                 ║")
@@ -89,7 +91,7 @@ def main():
         print(f"   {icon} {step}")
 
     print(f"\n   ⏱️  Tổng thời gian: {total_duration:.1f}s")
-    print(f"   🕐 Kết thúc: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   🕐 Kết thúc: {datetime.now(vn_tz).strftime('%Y-%m-%d %H:%M:%S')}")
 
     if all(results.values()):
         print("\n   🎉 PIPELINE CHẠY THÀNH CÔNG!")
