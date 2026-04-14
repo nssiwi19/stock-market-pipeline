@@ -27,7 +27,9 @@ jobs:
 
       - name: Run ETL Pipeline
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python run_pipeline.py
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }} # Thiếu dòng này là bot câm
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}     # Thiếu dòng này là bot điếc
+      run: |
+        python run_pipeline.py
