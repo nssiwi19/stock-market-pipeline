@@ -1,4 +1,4 @@
-vnstock==0.2.8.2
+vnstock
 supabase
 pandas
 python-dotenv
@@ -10,3 +10,4 @@ beautifulsoup4
 matplotlib
 seaborn
 cloudscraper
+tenacity
