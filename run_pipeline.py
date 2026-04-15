@@ -13,6 +13,7 @@ from etl import extract_tickers
 from etl import extract_daily_prices
 from etl import config
 from etl import notifier
+from etl.ai_agent import get_ai_market_summary
 import pandas as pd
 
 
@@ -117,9 +118,13 @@ def main():
             if response.data and len(response.data) > 0:
                 df_top = pd.DataFrame(response.data)
                 
+                # --- KÍCH HOẠT AI AGENT TẠI ĐÂY ---
+                ai_insight = get_ai_market_summary(df_top)
+                
+                # --- GHÉP CHỮ VÀO TIN NHẮN ---
                 msg = f"✅ *BÁO CÁO THỊ TRƯỜNG {datetime.now(vn_tz).strftime('%d/%m/%Y')}*\n"
-                msg += f"⏱️ Thời gian chạy: {total_duration:.1f}s\n"
-                msg += "🔥 *Dòng tiền đang tập trung vào:* " + ", ".join(df_top['ticker'].tolist())
+                msg += f"⏱️ Thời gian Pipeline cào dữ liệu: {total_duration:.1f}s\n\n"
+                msg += f"{ai_insight}\n" # Chèn đoạn văn của AI vào đây
                 
                 # Gửi báo cáo kèm biểu đồ
                 notifier.send_telegram_report_with_chart(df_top, msg)
