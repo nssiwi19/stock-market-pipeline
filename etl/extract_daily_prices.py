@@ -1,61 +1,59 @@
-import pandas as pd
-from vnstock import stock_historical_data
-from .config import get_supabase_client
 import time
-from datetime import datetime, timedelta, timezone # Thêm dòng import timezone
+from datetime import datetime, timedelta
+from vnstock import stock_historical_data
+from etl import config
 
-def fetch_and_store_daily_prices():
-    supabase = get_supabase_client()
-    if not supabase:
-        return False
-
+def extract_and_upsert_stock_data():
+    supabase = config.get_supabase_client()
+    
+    # 1. Lấy danh sách ticker từ bảng tickers
     response = supabase.table("tickers").select("ticker").execute()
     tickers = [item['ticker'] for item in response.data]
+    
+    # Cấu hình thời gian lấy dữ liệu (5 ngày gần nhất)
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+    
+    all_records = [] # Danh sách tạm để gom hàng
+    batch_size = 50  # Cứ 50 mã thì đẩy lên Supabase 1 lần
+    count = 0
 
-    # --- ĐOẠN CẦN SỬA: Xử lý múi giờ và Incremental Load ---
-    vn_tz = timezone(timedelta(hours=7))
-    end_date = datetime.now(vn_tz).strftime("%Y-%m-%d")
-    start_date = (datetime.now(vn_tz) - timedelta(days=5)).strftime("%Y-%m-%d")
-    # --------------------------------------------------------
+    print(f"🚀 Bắt đầu cào dữ liệu cho {len(tickers)} mã (Batch Size: {batch_size})...")
 
-    for i, ticker in enumerate(tickers):
+    for ticker in tickers:
         try:
-            # Sử dụng stock_historical_data
-            df = stock_historical_data(
-                symbol=ticker, 
-                start_date=start_date, # Sử dụng start_date mới (5 ngày gần nhất)
-                end_date=end_date, 
-                resolution='1D',
-                type='stock' 
-            )
+            # Lấy dữ liệu từ vnstock
+            df = stock_historical_data(symbol=ticker, start_date=start_date, end_date=end_date, resolution='1D', type='stock')
             
-            if df is None or df.empty:
-                continue
+            if not df.empty:
+                # Chuyển DataFrame thành danh sách các dictionary chuẩn schema
+                for _, row in df.iterrows():
+                    record = {
+                        "ticker": ticker,
+                        "trading_date": row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time']),
+                        "open_price": float(row['open']),
+                        "high_price": float(row['high']),
+                        "low_price": float(row['low']),
+                        "close_price": float(row['close']),
+                        "volume": int(row['volume'])
+                    }
+                    all_records.append(record)
+            
+            count += 1
+            # Giảm thời gian nghỉ xuống còn 0.1s vì ta không gọi DB liên tục nữa
+            time.sleep(0.1) 
 
-            records = []
-            for index, row in df.iterrows():
-                 record = {
-                     "ticker": ticker,
-                     "trading_date": str(row.get('time')).split(' ')[0], 
-                     "open_price": float(row.get('open', 0)),
-                     "high_price": float(row.get('high', 0)),
-                     "low_price": float(row.get('low', 0)),
-                     "close_price": float(row.get('close', 0)),
-                     "volume": int(row.get('volume', 0))
-                 }
-                 records.append(record)
-                 
-            if records:
-                # Upsert với on_conflict để tránh trùng lặp ngày/mã
-                supabase.table("daily_prices").upsert(records, on_conflict="ticker,trading_date").execute()
-                print(f"  Upserted data for {ticker} from {start_date} to {end_date}.")
-            
-            time.sleep(0.5) # Tránh bị rate limit
+            # 2. KIỂM TRA VÀ ĐẨY BATCH
+            if len(all_records) >= batch_size:
+                supabase.table("daily_prices").upsert(all_records).execute()
+                print(f"✅ Đã Upsert thành công lô {batch_size} mã. (Tiến độ: {count}/{len(tickers)})")
+                all_records = [] # Reset lại danh sách tạm
 
         except Exception as e:
-            print(f"  Error processing {ticker}: {e}")
-            
-    return True
+            print(f"⚠️ Lỗi khi lấy mã {ticker}: {e}")
+            continue
 
-if __name__ == "__main__":
-    fetch_and_store_daily_prices()
+    # 3. ĐẨY NỐT NHỮNG MÃ CÒN DƯ (nếu có)
+    if all_records:
+        supabase.table("daily_prices").upsert(all_records).execute()
+        print(f"🏁 Đã hoàn tất đẩy nốt {len(all_records)} bản ghi cuối cùng.")

@@ -77,7 +77,7 @@ def main():
     # Bước 2: Extract Daily Prices
     success, _ = run_step(
         "Bước 2: EXTRACT DAILY PRICES — Lấy lịch sử giá hàng ngày",
-        extract_daily_prices.fetch_and_store_daily_prices
+        extract_daily_prices.extract_and_upsert_stock_data
     )
     results["Extract Daily Prices"] = success
 
