@@ -9,3 +9,4 @@ plotly
 beautifulsoup4
 matplotlib
 seaborn
+cloudscraper

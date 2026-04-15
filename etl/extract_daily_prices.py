@@ -14,46 +14,54 @@ def extract_and_upsert_stock_data():
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
     
-    all_records = [] # Danh sách tạm để gom hàng
-    batch_size = 50  # Cứ 50 mã thì đẩy lên Supabase 1 lần
+    all_records = [] 
+    batch_size = 50 
     count = 0
 
     print(f"🚀 Bắt đầu cào dữ liệu cho {len(tickers)} mã (Batch Size: {batch_size})...")
 
     for ticker in tickers:
+        df = None # FIX LỖI MIM: Luôn khởi tạo df là None ở đầu mỗi vòng lặp
         try:
-            # Lấy dữ liệu từ vnstock
+            # Lấy dữ liệu
             df = stock_historical_data(symbol=ticker, start_date=start_date, end_date=end_date, resolution='1D', type='stock')
             
-            if not df.empty:
-                # Chuyển DataFrame thành danh sách các dictionary chuẩn schema
+            # Kiểm tra df tồn tại và không rỗng
+            if df is not None and not df.empty:
                 for _, row in df.iterrows():
-                    record = {
+                    all_records.append({
                         "ticker": ticker,
-                        "trading_date": row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time']),
+                        "trading_date": str(row['time'].date()) if hasattr(row['time'], 'date') else str(row['time']),
                         "open_price": float(row['open']),
                         "high_price": float(row['high']),
                         "low_price": float(row['low']),
                         "close_price": float(row['close']),
                         "volume": int(row['volume'])
-                    }
-                    all_records.append(record)
+                    })
             
             count += 1
-            # Giảm thời gian nghỉ xuống còn 0.1s vì ta không gọi DB liên tục nữa
             time.sleep(0.1) 
 
-            # 2. KIỂM TRA VÀ ĐẨY BATCH
+            # FIX LỖI TRÙNG LẶP: Đẩy batch và LÀM TRỐNG danh sách
             if len(all_records) >= batch_size:
-                supabase.table("daily_prices").upsert(all_records).execute()
-                print(f"✅ Đã Upsert thành công lô {batch_size} mã. (Tiến độ: {count}/{len(tickers)})")
-                all_records = [] # Reset lại danh sách tạm
+                # Thêm tham số on_conflict để Supabase biết đường mà ghi đè
+                supabase.table("daily_prices").upsert(
+                    all_records, 
+                    on_conflict="ticker,trading_date" 
+                ).execute()
+                
+                print(f"✅ Đã Upsert lô {len(all_records)} bản ghi. Tiến độ: {count}/{len(tickers)}")
+                all_records = [] # CỰC KỲ QUAN TRỌNG: Phải reset list về rỗng sau khi đẩy thành công
 
         except Exception as e:
-            print(f"⚠️ Lỗi khi lấy mã {ticker}: {e}")
-            continue
+            print(f"⚠️ Lỗi khi xử lý mã {ticker}: {e}")
+            # Nếu lỗi, ta bỏ qua mã này và đi tiếp, df = None đã bảo vệ ta khỏi lỗi "referenced before assignment"
+            continue 
 
-    # 3. ĐẨY NỐT NHỮNG MÃ CÒN DƯ (nếu có)
+    # Đừng quên lô cuối cùng còn sót lại
     if all_records:
-        supabase.table("daily_prices").upsert(all_records).execute()
-        print(f"🏁 Đã hoàn tất đẩy nốt {len(all_records)} bản ghi cuối cùng.")
+        supabase.table("daily_prices").upsert(all_records, on_conflict="ticker,trading_date").execute()
+        print(f"🏁 Hoàn tất nạp nốt {len(all_records)} bản ghi cuối.")
+
+if __name__ == "__main__":
+    extract_and_upsert_stock_data()

@@ -2,8 +2,8 @@ name: Daily Stock Market Pipeline
 
 on:
   schedule:
-    # Chạy lúc 18:00 VN (11:00 UTC) để đảm bảo dữ liệu thị trường đã chốt xong
-    - cron: '0 11 * * 1-5' 
+    # Chạy lúc 15:30 VN (08:30 UTC)
+    - cron: '30 8 * * 1-5' 
   workflow_dispatch: # Cho phép bấm Run thủ công
 
 jobs:
