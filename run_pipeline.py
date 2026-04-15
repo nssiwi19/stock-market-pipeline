@@ -87,6 +87,19 @@ def main():
         notifier.send_telegram_msg(f"🚨 *Stock Pipeline Alert*\n{error_msg}")
         sys.exit(1)
 
+    # Bước 3: Extract Financials
+    success, _ = run_step(
+        "Bước 3: EXTRACT FINANCIALS — Lấy báo cáo tài chính",
+        extract_financials.fetch_and_store_financials
+    )
+    results["Extract Financials"] = success
+
+    if not success:
+        # Nếu lấy BCTC lỗi, chỉ báo cho user biết chứ không dừng pipeline để vẫn xuất được báo cáo giá
+        warn_msg = "⚠️ Cảnh báo: Lấy dữ liệu tài chính (Extract Financials) thất bại. Kiểm tra log."
+        print(f"\n{warn_msg}")
+        notifier.send_telegram_msg(f"🚨 *Stock Pipeline Warning*\n{warn_msg}")
+
     # Tổng kết
     total_duration = (datetime.now(vn_tz) - start_time).total_seconds()
 
