@@ -45,12 +45,13 @@ def send_telegram_report_with_chart(df, message):
         
     try:
         # 1. Tiền xử lý dữ liệu (Lấy 5 mã có khối lượng giao dịch lớn nhất)
-        top_5 = df.nlargest(5, 'volume')
+        top_5 = df.nlargest(5, 'volume').copy() # Thêm .copy() để tránh warning của Pandas
+        
+        # KHÔI PHỤC GIÁ TRỊ THỰC: Nhân giá đóng cửa với 1000
+        top_5['close_price'] = top_5['close_price'] * 1000 
         
         # 2. Vẽ biểu đồ Bar Chart với Seaborn
-        matplotlib.use('Agg') # Đảm bảo chạy được trên server (non-GUI)
-        sns.set_theme(style="darkgrid", palette="muted")
-        plt.figure(figsize=(10, 6))
+        matplotlib.use('Agg') 
         
         # Vẽ Barplot
         ax = sns.barplot(x='ticker', y='close_price', data=top_5, hue='ticker', palette='viridis', legend=False)
