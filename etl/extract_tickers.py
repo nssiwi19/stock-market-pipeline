@@ -13,7 +13,7 @@ def _clean_text(value, fallback: str = "N/A") -> str:
     if value is None:
         return fallback
     text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "null", "<na>"}:
+    if not text or text.lower() in {"nan", "none", "null", "<na>", "n/a", "unknown"}:
         return fallback
     return text
 
@@ -70,18 +70,22 @@ def fetch_and_store_tickers():
         records_to_insert = []
         for _, row in df_filtered.iterrows():
             ticker = row.get('symbol', row.get('ticker', ''))
-            exchange = row.get('comGroupCode', row.get('exchange', row.get('market', 'N/A')))
-            industry = row.get('icbName3', row.get('industry', row.get('icb_name3', 'N/A')))
-            company_name = row.get('organ_name', row.get('organName', row.get('company_name', 'N/A')))
+            exchange = row.get('comGroupCode', row.get('exchange', row.get('market')))
+            industry = row.get('icbName3', row.get('industry', row.get('icb_name3')))
+            company_name = row.get('organ_name', row.get('organName', row.get('company_name')))
 
             if ticker:
                 clean_ticker = _clean_text(ticker, fallback="")
                 if not clean_ticker:
                     continue
                 existing = existing_map.get(clean_ticker, {})
-                clean_exchange = _clean_nullable_text(exchange) or existing.get("exchange") or "UNKNOWN"
-                clean_industry = _clean_nullable_text(industry) or existing.get("industry")
-                clean_company_name = _clean_nullable_text(company_name) or existing.get("company_name")
+                clean_exchange = (
+                    _clean_nullable_text(exchange)
+                    or _clean_nullable_text(existing.get("exchange"))
+                    or "UNKNOWN"
+                )
+                clean_industry = _clean_nullable_text(industry) or _clean_nullable_text(existing.get("industry"))
+                clean_company_name = _clean_nullable_text(company_name) or _clean_nullable_text(existing.get("company_name"))
                 records_to_insert.append({
                     "ticker": clean_ticker,
                     "exchange": clean_exchange,
@@ -97,7 +101,7 @@ def fetch_and_store_tickers():
             upserted_count = 0
             for i in range(0, len(records_to_insert), batch_size):
                 batch = records_to_insert[i:i + batch_size]
-                supabase.table("tickers").upsert(batch).execute()
+                supabase.table("tickers").upsert(batch, on_conflict="ticker").execute()
                 upserted_count += len(batch)
             print("Successfully populated the `tickers` table.")
             return {

@@ -10,9 +10,30 @@ def _clean_nullable_text(value):
     if value is None:
         return None
     text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "null", "<na>"}:
+    if not text or text.lower() in {"nan", "none", "null", "<na>", "n/a", "unknown"}:
         return None
     return text
+
+
+def _fetch_all_existing_tickers(supabase, page_size: int = 1000) -> list[dict]:
+    """Lấy toàn bộ metadata ticker hiện có để tránh overwrite bằng dữ liệu thiếu."""
+    all_rows = []
+    offset = 0
+    while True:
+        res = (
+            supabase.table("tickers")
+            .select("ticker,industry,exchange,company_name")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        batch = res.data or []
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return all_rows
 
 
 def _load_company_profile_df():
@@ -199,8 +220,10 @@ def enrich_tickers_with_company_info():
     Lấy hồ sơ doanh nghiệp và cập nhật trực tiếp vào bảng tickers
     để đảm bảo cột industry/company_name đầy đủ cho BI.
     """
-    print("📡 Enrichment: lấy hồ sơ doanh nghiệp (industry/company_name/exchange)...")
+    print("[ENRICH] Lay ho so doanh nghiep (industry/company_name/exchange)...")
     supabase = get_supabase_client()
+    existing_rows = _fetch_all_existing_tickers(supabase)
+    existing_map = {row["ticker"]: row for row in existing_rows if row.get("ticker")}
 
     df = _load_company_profile_df()
     exchange_map, industry_map = _load_enrichment_maps()
@@ -250,15 +273,26 @@ def enrich_tickers_with_company_info():
         clean_ticker = _clean_nullable_text(ticker)
         if not clean_ticker:
             continue
-        industry_value = industry_map.get(clean_ticker) or _clean_nullable_text(row.get("icbName3"))
-        exchange_value = exchange_map.get(clean_ticker) or _clean_nullable_text(row.get("comGroupCode")) or "UNKNOWN"
+        existing = existing_map.get(clean_ticker, {})
+        industry_value = (
+            industry_map.get(clean_ticker)
+            or _clean_nullable_text(row.get("icbName3"))
+            or _clean_nullable_text(existing.get("industry"))
+        )
+        exchange_value = (
+            exchange_map.get(clean_ticker)
+            or _clean_nullable_text(row.get("comGroupCode"))
+            or _clean_nullable_text(existing.get("exchange"))
+            or "UNKNOWN"
+        )
+        company_name_value = _clean_nullable_text(row.get("organName")) or _clean_nullable_text(existing.get("company_name"))
         if _is_missing_industry(industry_value):
             missing_industry_tickers.append(clean_ticker)
 
         records_to_upsert.append(
             {
                 "ticker": clean_ticker,
-                "company_name": _clean_nullable_text(row.get("organName")),
+                "company_name": company_name_value,
                 "industry": industry_value,
                 "exchange": exchange_value,
             }
@@ -273,12 +307,12 @@ def enrich_tickers_with_company_info():
         fallback_targets = missing_industry_tickers[:max_fallback_tickers]
 
         print(
-            f"🔎 Fallback enrichment qua Company.overview() cho {len(fallback_targets)}/{len(missing_industry_tickers)} "
-            "mã thiếu ngành..."
+            f"[ENRICH] Fallback Company.overview() cho {len(fallback_targets)}/{len(missing_industry_tickers)} "
+            "ma thieu nganh..."
         )
         if len(missing_industry_tickers) > max_fallback_tickers:
             print(
-                f"ℹ️ Còn {len(missing_industry_tickers) - max_fallback_tickers} mã chưa enrich ở lượt này "
+                f"[ENRICH] Con {len(missing_industry_tickers) - max_fallback_tickers} ma chua enrich o luot nay "
                 f"(giới hạn ENRICH_OVERVIEW_MAX_TICKERS={max_fallback_tickers})."
             )
 
@@ -308,7 +342,7 @@ def enrich_tickers_with_company_info():
         supabase.table("tickers").upsert(batch, on_conflict="ticker").execute()
         upserted_count += len(batch)
 
-    print(f"✅ Enrichment hoàn tất: {upserted_count} mã được cập nhật vào bảng tickers.")
+    print(f"[ENRICH] Hoan tat: {upserted_count} ma duoc cap nhat vao bang tickers.")
     missing_after = sum(1 for r in records_to_upsert if _is_missing_industry(r.get("industry")))
     return {
         "step": "enrich_company_info",
