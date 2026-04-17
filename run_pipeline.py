@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from etl import extract_financials
 from etl import extract_tickers
 from etl import extract_daily_prices
+from etl import populate_company_info
 from etl import config
 from etl import notifier
 from etl.ai_agent import get_ai_market_summary
@@ -74,6 +75,13 @@ def normalize_step_contract(step_key: str, call_success: bool, result) -> dict:
     }
 
 
+def _is_env_true(env_name: str, default: bool = False) -> bool:
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def main():
     vn_tz = timezone(timedelta(hours=7))
     start_time = datetime.now(vn_tz)
@@ -111,9 +119,38 @@ def main():
         notifier.send_telegram_msg(f"🚨 *Stock Pipeline Alert*\n{error_msg}")
         sys.exit(1)
 
-    # Bước 2: Extract Daily Prices
+    skip_enrich = _is_env_true("PIPELINE_SKIP_ENRICH", default=False)
+    if skip_enrich:
+        print("\n⏭️ Bỏ qua Bước 2: ENRICH COMPANY INFO (PIPELINE_SKIP_ENRICH=true)")
+        enrich_contract = {
+            "step": "Enrich Company Info",
+            "success": True,
+            "skipped": True,
+            "errors": 0,
+            "error_rate": 0.0,
+        }
+        contracts["Enrich Company Info"] = enrich_contract
+        results["Enrich Company Info"] = True
+    else:
+        # Bước 2: Enrich Company Info (industry/company_name)
+        success, result = run_step(
+            "Bước 2: ENRICH COMPANY INFO — Làm giàu ngành và thông tin công ty",
+            populate_company_info.enrich_tickers_with_company_info
+        )
+        enrich_contract = normalize_step_contract("Enrich Company Info", success, result)
+        contracts["Enrich Company Info"] = enrich_contract
+        results["Enrich Company Info"] = bool(enrich_contract.get("success", False))
+
+        if not results["Enrich Company Info"]:
+            error_msg = "❌ Pipeline dừng lại: Enrich Company Info thất bại."
+            print(f"\n{error_msg}")
+            print(f"   Chi tiết: {enrich_contract}")
+            notifier.send_telegram_msg(f"🚨 *Stock Pipeline Alert*\n{error_msg}")
+            sys.exit(1)
+
+    # Bước 3: Extract Daily Prices
     success, result = run_step(
-        "Bước 2: EXTRACT DAILY PRICES — Lấy lịch sử giá hàng ngày",
+        "Bước 3: EXTRACT DAILY PRICES — Lấy lịch sử giá hàng ngày",
         extract_daily_prices.extract_and_upsert_stock_data
     )
     prices_contract = normalize_step_contract("Extract Daily Prices", success, result)
@@ -127,9 +164,9 @@ def main():
         notifier.send_telegram_msg(f"🚨 *Stock Pipeline Alert*\n{error_msg}")
         sys.exit(1)
 
-    # Bước 3: Extract Financials
+    # Bước 4: Extract Financials
     success, result = run_step(
-        "Bước 3: EXTRACT FINANCIALS — Lấy báo cáo tài chính",
+        "Bước 4: EXTRACT FINANCIALS — Lấy báo cáo tài chính",
         extract_financials.fetch_and_store_financials
     )
     financials_contract = normalize_step_contract("Extract Financials", success, result)

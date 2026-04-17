@@ -8,6 +8,42 @@ from vnstock import Listing
 from .config import get_supabase_client
 
 
+def _clean_text(value, fallback: str = "N/A") -> str:
+    """Chuẩn hóa giá trị text, tránh lưu 'nan'/'none' dạng chuỗi."""
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "<na>"}:
+        return fallback
+    return text
+
+
+def _clean_nullable_text(value):
+    text = _clean_text(value, fallback="")
+    return text if text else None
+
+
+def _fetch_all_existing_tickers(supabase, page_size: int = 1000) -> list[dict]:
+    """Lấy toàn bộ tickers hiện có bằng pagination (Supabase mặc định limit 1000)."""
+    all_rows = []
+    offset = 0
+    while True:
+        res = (
+            supabase.table("tickers")
+            .select("ticker,industry,exchange,company_name")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        batch = res.data or []
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return all_rows
+
+
 def fetch_and_store_tickers():
     """Lấy danh sách mã HOSE + HNX từ vnstock3 và upsert vào Supabase."""
     print("Fetching active tickers from the market (vnstock3 Listing)...")
@@ -27,24 +63,34 @@ def fetch_and_store_tickers():
             df_filtered = df_symbols
             print(f"  ⚠️ Không tìm thấy cột exchange. Columns: {list(df_symbols.columns)}")
 
+        supabase = get_supabase_client()
+        existing_rows = _fetch_all_existing_tickers(supabase)
+        existing_map = {row["ticker"]: row for row in existing_rows if row.get("ticker")}
+
         records_to_insert = []
         for _, row in df_filtered.iterrows():
             ticker = row.get('symbol', row.get('ticker', ''))
-            exchange = row.get('comGroupCode', row.get('exchange', 'N/A'))
-            industry = row.get('icbName3', row.get('industry', 'N/A'))
+            exchange = row.get('comGroupCode', row.get('exchange', row.get('market', 'N/A')))
+            industry = row.get('icbName3', row.get('industry', row.get('icb_name3', 'N/A')))
             company_name = row.get('organ_name', row.get('organName', row.get('company_name', 'N/A')))
 
             if ticker:
+                clean_ticker = _clean_text(ticker, fallback="")
+                if not clean_ticker:
+                    continue
+                existing = existing_map.get(clean_ticker, {})
+                clean_exchange = _clean_nullable_text(exchange) or existing.get("exchange") or "UNKNOWN"
+                clean_industry = _clean_nullable_text(industry) or existing.get("industry")
+                clean_company_name = _clean_nullable_text(company_name) or existing.get("company_name")
                 records_to_insert.append({
-                    "ticker": str(ticker),
-                    "exchange": str(exchange) if exchange else 'N/A',
-                    "industry": str(industry) if industry else 'N/A',
-                    "company_name": str(company_name) if company_name else 'N/A'
+                    "ticker": clean_ticker,
+                    "exchange": clean_exchange,
+                    "industry": clean_industry,
+                    "company_name": clean_company_name,
                 })
 
         print(f"Found {len(records_to_insert)} tickers.")
 
-        supabase = get_supabase_client()
         if supabase:
             # Upsert theo batch để tránh payload quá lớn
             batch_size = 100

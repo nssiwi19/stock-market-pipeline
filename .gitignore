@@ -14,3 +14,7 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# Runtime/debug artifacts
+etl/dead_letter/
+tmp_*
