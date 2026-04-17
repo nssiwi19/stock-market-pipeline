@@ -18,6 +18,54 @@ def _extract_ai_text(result_json: dict) -> str | None:
     text = parts[0].get("text", "")
     return text.strip() if text else None
 
+
+def _discover_generate_models(api_key: str) -> list[str]:
+    """
+    Gọi ListModels để lấy danh sách model thực sự hỗ trợ generateContent.
+    Trả về tên dạng 'gemini-xxx' (không có prefix models/).
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        discovered = []
+        for m in data.get("models", []):
+            methods = m.get("supportedGenerationMethods", []) or []
+            if "generateContent" not in methods:
+                continue
+            name = m.get("name", "")
+            if name.startswith("models/"):
+                name = name.split("/", 1)[1]
+            if name:
+                discovered.append(name)
+        return discovered
+    except Exception:
+        return []
+
+
+def _build_candidate_models(api_key: str) -> list[str]:
+    """Ưu tiên model từ env, sau đó fallback theo list động từ API."""
+    models_from_env = os.getenv("GEMINI_MODELS", "").strip()
+    env_models = [m.strip() for m in models_from_env.split(",") if m.strip()] if models_from_env else []
+    discovered_models = _discover_generate_models(api_key)
+
+    # Ưu tiên flash trước để tiết kiệm chi phí/thời gian
+    flash_models = [m for m in discovered_models if "flash" in m]
+    non_flash_models = [m for m in discovered_models if "flash" not in m]
+    merged = env_models + flash_models + non_flash_models
+
+    # Dedup giữ thứ tự
+    seen = set()
+    ordered = []
+    for model in merged:
+        if model in seen:
+            continue
+        seen.add(model)
+        ordered.append(model)
+    return ordered
+
 def get_ai_market_summary(df_top):
     """Dùng Gemini AI để phân tích và viết nhận định thị trường dựa trên dữ liệu giá."""
     api_key = os.getenv("GEMINI_API_KEY")
@@ -42,16 +90,10 @@ def get_ai_market_summary(df_top):
     Giọng văn năng động, truyền cảm hứng. Không cần lặp lại các con số cụ thể vì tôi đã xem biểu đồ, chỉ cần đưa ra 'Insight' (Góc nhìn).
     """
     
-    # 3. Gửi yêu cầu qua Gemini API với fallback models.
-    # Có thể override bằng biến GEMINI_MODELS="model-a,model-b"
-    models_from_env = os.getenv("GEMINI_MODELS", "").strip()
-    if models_from_env:
-        candidate_models = [m.strip() for m in models_from_env.split(",") if m.strip()]
-    else:
-        candidate_models = [
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-        ]
+    # 3. Gửi yêu cầu qua Gemini API với model discovery để tránh hardcode model chết.
+    candidate_models = _build_candidate_models(api_key)
+    if not candidate_models:
+        return "🤖 *(Lỗi AI: không lấy được danh sách model khả dụng từ Gemini ListModels.)*"
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -81,4 +123,4 @@ def get_ai_market_summary(df_top):
         except Exception as e:
             errors.append(f"{model_name}: lỗi kết nối - {e}")
 
-    return "🤖 *(Lỗi AI: không gọi được model phù hợp. " + " | ".join(errors[:2]) + ")*"
+    return "🤖 *(Lỗi AI: không gọi được model phù hợp. " + " | ".join(errors[:3]) + ")*"
