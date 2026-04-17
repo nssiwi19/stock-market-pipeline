@@ -1,3 +1,4 @@
+import os
 from vnstock import stock_historical_data, listing_companies
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import insert
@@ -5,9 +6,16 @@ import pandas as pd
 import time
 import datetime
 
-# 1. Cấu hình Database
-db_uri = "postgresql://postgres:%26Y2FJ5L9nWxXtmM@db.xqargstnhajgdkfrneqb.supabase.co:5432/postgres"
-engine = create_engine(db_uri)
+
+def _get_db_uri() -> str:
+    """Lấy DB URI từ biến môi trường để tránh lộ thông tin nhạy cảm."""
+    db_uri = os.getenv("SUPABASE_DB_URI") or os.getenv("DATABASE_URL")
+    if not db_uri:
+        raise ValueError("Thiếu SUPABASE_DB_URI (hoặc DATABASE_URL) trong biến môi trường.")
+    return db_uri
+
+
+engine = create_engine(_get_db_uri())
 
 def postgres_upsert(table, conn, keys, data_iter):
     data = [dict(zip(keys, row)) for row in data_iter]

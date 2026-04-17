@@ -7,6 +7,10 @@ URL: https://kbbuddywts.kbsec.com.vn/iis-server/investment/stocks/{ticker}/data_
 ThreadPoolExecutor (max_workers=10) + Tenacity retry + Batch upsert + Dedup.
 """
 
+import json
+import os
+import time
+from pathlib import Path
 import requests
 from datetime import datetime, timedelta
 from etl import config
@@ -88,19 +92,113 @@ def _dedup_records(records: list[dict], keys: tuple) -> list[dict]:
     return list(seen.values())
 
 
+def _persist_failed_batch(table_name: str, batch: list[dict], error: Exception) -> str:
+    """Ghi batch lỗi ra dead-letter để có thể replay thủ công."""
+    dead_letter_dir = Path(__file__).resolve().parent / "dead_letter"
+    dead_letter_dir.mkdir(parents=True, exist_ok=True)
+    file_path = dead_letter_dir / f"{table_name}_failed_batches.jsonl"
+
+    payload = {
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "table": table_name,
+        "error": str(error),
+        "batch_size": len(batch),
+        "records": batch,
+    }
+    with file_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return str(file_path)
+
+
+def _is_price_logic_valid(record: dict) -> bool:
+    """
+    Validate logic OHLC cơ bản để tránh vi phạm check_price_logic ở DB.
+    Rule tối thiểu:
+      - low <= high
+      - low <= open/close <= high
+      - volume >= 0
+    """
+    try:
+        o = float(record["open_price"])
+        h = float(record["high_price"])
+        l = float(record["low_price"])
+        c = float(record["close_price"])
+        v = int(record["volume"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    if l > h:
+        return False
+    if not (l <= o <= h):
+        return False
+    if not (l <= c <= h):
+        return False
+    if v < 0:
+        return False
+    return True
+
+
+def _split_valid_invalid_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Tách records hợp lệ và records vi phạm price logic."""
+    valid_records = []
+    invalid_records = []
+    for r in records:
+        if _is_price_logic_valid(r):
+            valid_records.append(r)
+        else:
+            invalid_records.append(r)
+    return valid_records, invalid_records
+
+
+def _upsert_with_retry(supabase, table_name: str, batch: list[dict], on_conflict: str, max_attempts: int = 3):
+    """Upsert có retry; trả về tuple (success, error)."""
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            supabase.table(table_name).upsert(batch, on_conflict=on_conflict).execute()
+            return True, None
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_attempts:
+                sleep_s = 2 ** (attempt - 1)
+                print(f"⚠️ Upsert {table_name} lỗi (attempt {attempt}/{max_attempts}), retry sau {sleep_s}s: {exc}")
+                time.sleep(sleep_s)
+    return False, last_error
+
+
 def extract_and_upsert_stock_data():
     """Orchestrator: Quét toàn bộ tickers qua KBS API, 10 luồng song song."""
     supabase = config.get_supabase_client()
 
     response = supabase.table("tickers").select("ticker").execute()
     tickers = [item['ticker'] for item in response.data]
+    if not tickers:
+        return {
+            "step": "extract_daily_prices",
+            "success": False,
+            "records_fetched": 0,
+            "records_upserted": 0,
+            "errors": 1,
+            "error_rate": 1.0,
+            "failed_batches": 0,
+            "fail_fast_triggered": False,
+            "message": "Không có ticker nào trong bảng tickers.",
+        }
 
     cutoff_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+    max_error_rate = float(os.getenv("PIPELINE_MAX_ERROR_RATE", "0.25"))
+    min_processed_before_fail_fast = int(os.getenv("PIPELINE_MIN_ITEMS_FOR_FAIL_FAST", "20"))
 
     all_records = []
     batch_size = 50
     count = 0
     error_count = 0
+    not_found_count = 0
+    records_fetched = 0
+    records_upserted = 0
+    rejected_records = 0
+    failed_batches = 0
+    fail_fast_triggered = False
 
     print(f"🚀 Bắt đầu cào dữ liệu giá (DIRECT KBS API) cho {len(tickers)} mã...")
     print(f"🚀 ThreadPoolExecutor(max_workers=10) — KHÔNG rate limit!")
@@ -116,40 +214,122 @@ def extract_and_upsert_stock_data():
             try:
                 records = future.result()
                 if records:
+                    records_fetched += len(records)
                     all_records.extend(records)
+            except PermanentError:
+                not_found_count += 1
             except Exception as exc:
                 error_count += 1
-                # Chỉ log lỗi thực sự, bỏ qua mã không có data
-                if '404' not in str(exc):
-                    print(f"❌ LỖI MÃ {ticker}: {exc}")
+                print(f"❌ LỖI MÃ {ticker}: {exc}")
 
             count += 1
+            current_error_rate = (error_count / count) if count > 0 else 0
+            if count >= min_processed_before_fail_fast and current_error_rate > max_error_rate:
+                fail_fast_triggered = True
+                print(
+                    f"🛑 FAIL-FAST: Tỷ lệ lỗi {current_error_rate:.1%} vượt ngưỡng {max_error_rate:.1%} "
+                    f"sau {count} mã."
+                )
+                break
 
             if len(all_records) >= batch_size:
                 batch = _dedup_records(all_records[:batch_size], ('ticker', 'trading_date'))
-                all_records = all_records[batch_size:]
+                valid_batch, invalid_batch = _split_valid_invalid_records(batch)
+                if invalid_batch:
+                    rejected_records += len(invalid_batch)
+                    path = _persist_failed_batch(
+                        "daily_prices_invalid_rows",
+                        invalid_batch,
+                        Exception("Vi phạm check_price_logic (pre-check)"),
+                    )
+                    print(
+                        f"⚠️ Loại {len(invalid_batch)} rows vi phạm price logic. "
+                        f"Đã lưu dead-letter: {path}"
+                    )
 
-                try:
-                    supabase.table("daily_prices").upsert(
-                        batch, on_conflict="ticker,trading_date"
-                    ).execute()
+                if not valid_batch:
+                    all_records = all_records[batch_size:]
+                    continue
+
+                success, err = _upsert_with_retry(
+                    supabase=supabase,
+                    table_name="daily_prices",
+                    batch=valid_batch,
+                    on_conflict="ticker,trading_date",
+                    max_attempts=3,
+                )
+                if success:
+                    records_upserted += len(valid_batch)
                     print(f"✅ Upsert lô giá. Tiến độ: {count}/{len(tickers)}")
-                except Exception as e:
-                    print(f"💥 Lỗi Supabase: {e}")
+                else:
+                    failed_batches += 1
+                    path = _persist_failed_batch("daily_prices", valid_batch, err)
+                    print(f"💥 Lỗi Supabase sau retry. Đã lưu dead-letter: {path}")
+                all_records = all_records[batch_size:]
 
     # Lô cuối
     if all_records:
         batch = _dedup_records(all_records, ('ticker', 'trading_date'))
-        try:
-            supabase.table("daily_prices").upsert(
-                batch, on_conflict="ticker,trading_date"
-            ).execute()
-            print(f"🏁 Nạp nốt {len(batch)} bản ghi cuối.")
-        except Exception as e:
-            print(f"💥 Lỗi Supabase lô cuối: {e}")
+        valid_batch, invalid_batch = _split_valid_invalid_records(batch)
+        if invalid_batch:
+            rejected_records += len(invalid_batch)
+            path = _persist_failed_batch(
+                "daily_prices_invalid_rows",
+                invalid_batch,
+                Exception("Vi phạm check_price_logic (pre-check)"),
+            )
+            print(
+                f"⚠️ Loại {len(invalid_batch)} rows vi phạm price logic ở lô cuối. "
+                f"Đã lưu dead-letter: {path}"
+            )
+
+        if valid_batch:
+            success, err = _upsert_with_retry(
+                supabase=supabase,
+                table_name="daily_prices",
+                batch=valid_batch,
+                on_conflict="ticker,trading_date",
+                max_attempts=3,
+            )
+            if success:
+                records_upserted += len(valid_batch)
+                print(f"🏁 Nạp nốt {len(valid_batch)} bản ghi cuối.")
+            else:
+                failed_batches += 1
+                path = _persist_failed_batch("daily_prices", valid_batch, err)
+                print(f"💥 Lỗi Supabase lô cuối sau retry. Đã lưu dead-letter: {path}")
 
     success_rate = ((count - error_count) / count * 100) if count > 0 else 0
     print(f"🏁 Hoàn tất. Thành công: {count - error_count}/{count} ({success_rate:.1f}%)")
+    print(
+        f"📦 Records fetched={records_fetched}, upserted={records_upserted}, "
+        f"rejected_records={rejected_records}, failed_batches={failed_batches}, not_found={not_found_count}"
+    )
+
+    final_error_rate = (error_count / count) if count > 0 else 1.0
+    rejected_rate = (rejected_records / records_fetched) if records_fetched > 0 else 0.0
+    max_rejected_rate = float(os.getenv("PIPELINE_MAX_REJECTED_RATE", "0.03"))
+    is_success = (
+        not fail_fast_triggered
+        and failed_batches == 0
+        and final_error_rate <= max_error_rate
+        and rejected_rate <= max_rejected_rate
+    )
+    return {
+        "step": "extract_daily_prices",
+        "success": is_success,
+        "records_fetched": records_fetched,
+        "records_upserted": records_upserted,
+        "rejected_records": rejected_records,
+        "rejected_rate": round(rejected_rate, 4),
+        "errors": error_count,
+        "error_rate": round(final_error_rate, 4),
+        "failed_batches": failed_batches,
+        "not_found": not_found_count,
+        "fail_fast_triggered": fail_fast_triggered,
+        "max_error_rate": max_error_rate,
+        "max_rejected_rate": max_rejected_rate,
+    }
 
 
 if __name__ == "__main__":

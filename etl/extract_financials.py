@@ -10,6 +10,10 @@ Mỗi trang trả về 3-4 năm dữ liệu trong 1 request duy nhất.
 ThreadPoolExecutor (max_workers=10) + Tenacity retry + Batch upsert.
 """
 
+import json
+import os
+import time
+from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -139,17 +143,69 @@ def fetch_single_ticker_financials(ticker: str) -> list[dict]:
     return extracted_records
 
 
+def _persist_failed_batch(table_name: str, batch: list[dict], error: Exception) -> str:
+    """Ghi batch lỗi ra dead-letter để có thể replay thủ công."""
+    dead_letter_dir = Path(__file__).resolve().parent / "dead_letter"
+    dead_letter_dir.mkdir(parents=True, exist_ok=True)
+    file_path = dead_letter_dir / f"{table_name}_failed_batches.jsonl"
+
+    payload = {
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "table": table_name,
+        "error": str(error),
+        "batch_size": len(batch),
+        "records": batch,
+    }
+    with file_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return str(file_path)
+
+
+def _upsert_with_retry(supabase, table_name: str, batch: list[dict], on_conflict: str, max_attempts: int = 3):
+    """Upsert có retry; trả về tuple (success, error)."""
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            supabase.table(table_name).upsert(batch, on_conflict=on_conflict).execute()
+            return True, None
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_attempts:
+                sleep_s = 2 ** (attempt - 1)
+                print(f"⚠️ Upsert {table_name} lỗi (attempt {attempt}/{max_attempts}), retry sau {sleep_s}s: {exc}")
+                time.sleep(sleep_s)
+    return False, last_error
+
+
 def fetch_and_store_financials():
     """Orchestrator: Quét toàn bộ tickers, scrape Cafef đa luồng, batch upsert."""
     supabase = config.get_supabase_client()
 
     response = supabase.table("tickers").select("ticker").execute()
     tickers = [item['ticker'] for item in response.data]
+    if not tickers:
+        return {
+            "step": "extract_financials",
+            "success": False,
+            "records_fetched": 0,
+            "records_upserted": 0,
+            "errors": 1,
+            "error_rate": 1.0,
+            "failed_batches": 0,
+            "fail_fast_triggered": False,
+            "message": "Không có ticker nào trong bảng tickers.",
+        }
 
     all_financials = []
     batch_size = 30
     count = 0
     error_count = 0
+    records_fetched = 0
+    records_upserted = 0
+    failed_batches = 0
+    fail_fast_triggered = False
+    max_error_rate = float(os.getenv("PIPELINE_MAX_ERROR_RATE", "0.25"))
+    min_processed_before_fail_fast = int(os.getenv("PIPELINE_MIN_ITEMS_FOR_FAIL_FAST", "20"))
 
     print(f"📊 Bắt đầu cào BCTC (Cafef IncSta + BSheet) cho {len(tickers)} mã...")
     print(f"🚀 ThreadPoolExecutor(max_workers=10) — 2 req/mã, ~{len(tickers)*2//10}s ETA")
@@ -165,35 +221,80 @@ def fetch_and_store_financials():
             try:
                 records = future.result()
                 if records:
+                    records_fetched += len(records)
                     all_financials.extend(records)
             except Exception as exc:
                 error_count += 1
+                print(f"❌ LỖI MÃ {ticker}: {exc}")
 
             count += 1
+            current_error_rate = (error_count / count) if count > 0 else 0
+            if count >= min_processed_before_fail_fast and current_error_rate > max_error_rate:
+                fail_fast_triggered = True
+                print(
+                    f"🛑 FAIL-FAST: Tỷ lệ lỗi {current_error_rate:.1%} vượt ngưỡng {max_error_rate:.1%} "
+                    f"sau {count} mã."
+                )
+                break
 
             if len(all_financials) >= batch_size:
                 batch = all_financials[:batch_size]
+                success, err = _upsert_with_retry(
+                    supabase=supabase,
+                    table_name="financial_reports",
+                    batch=batch,
+                    on_conflict="ticker,report_type,period",
+                    max_attempts=3,
+                )
+                if success:
+                    records_upserted += len(batch)
+                    print(f"✅ Upsert lô BCTC. Tiến độ: {count}/{len(tickers)} | Records: {len(batch)}")
+                else:
+                    failed_batches += 1
+                    path = _persist_failed_batch("financial_reports", batch, err)
+                    print(f"💥 Lỗi Supabase sau retry. Đã lưu dead-letter: {path}")
                 all_financials = all_financials[batch_size:]
 
-                try:
-                    supabase.table("financial_reports").upsert(
-                        batch, on_conflict="ticker,report_type,period"
-                    ).execute()
-                    print(f"✅ Upsert lô BCTC. Tiến độ: {count}/{len(tickers)} | Records: {len(batch)}")
-                except Exception as e:
-                    print(f"💥 Lỗi Supabase: {e}")
-
     if all_financials:
-        try:
-            supabase.table("financial_reports").upsert(
-                all_financials, on_conflict="ticker,report_type,period"
-            ).execute()
+        success, err = _upsert_with_retry(
+            supabase=supabase,
+            table_name="financial_reports",
+            batch=all_financials,
+            on_conflict="ticker,report_type,period",
+            max_attempts=3,
+        )
+        if success:
+            records_upserted += len(all_financials)
             print(f"🏁 Nạp nốt {len(all_financials)} bản ghi cuối.")
-        except Exception as e:
-            print(f"💥 Lỗi Supabase lô cuối: {e}")
+        else:
+            failed_batches += 1
+            path = _persist_failed_batch("financial_reports", all_financials, err)
+            print(f"💥 Lỗi Supabase lô cuối sau retry. Đã lưu dead-letter: {path}")
 
     success_rate = ((count - error_count) / count * 100) if count > 0 else 0
     print(f"🏁 Hoàn tất. Thành công: {count - error_count}/{count} ({success_rate:.1f}%)")
+    print(
+        f"📦 Records fetched={records_fetched}, upserted={records_upserted}, "
+        f"failed_batches={failed_batches}"
+    )
+
+    final_error_rate = (error_count / count) if count > 0 else 1.0
+    is_success = (
+        not fail_fast_triggered
+        and failed_batches == 0
+        and final_error_rate <= max_error_rate
+    )
+    return {
+        "step": "extract_financials",
+        "success": is_success,
+        "records_fetched": records_fetched,
+        "records_upserted": records_upserted,
+        "errors": error_count,
+        "error_rate": round(final_error_rate, 4),
+        "failed_batches": failed_batches,
+        "fail_fast_triggered": fail_fast_triggered,
+        "max_error_rate": max_error_rate,
+    }
 
 
 if __name__ == "__main__":

@@ -1,11 +1,19 @@
+import os
 from vnstock import listing_companies
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import insert
 import pandas as pd
 
-# 1. Cấu hình
-db_uri = "postgresql://postgres:%26Y2FJ5L9nWxXtmM@db.xqargstnhajgdkfrneqb.supabase.co:5432/postgres"
-engine = create_engine(db_uri)
+
+def _get_db_uri() -> str:
+    """Lấy DB URI từ biến môi trường, không cho phép hardcode secret trong code."""
+    db_uri = os.getenv("SUPABASE_DB_URI") or os.getenv("DATABASE_URL")
+    if not db_uri:
+        raise ValueError("Thiếu SUPABASE_DB_URI (hoặc DATABASE_URL) trong biến môi trường.")
+    return db_uri
+
+
+engine = create_engine(_get_db_uri())
 
 def crawl_master_data():
     print("📡 Đang lấy danh sách 1.600 mã từ HOSE & HNX...")

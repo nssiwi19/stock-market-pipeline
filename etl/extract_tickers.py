@@ -48,20 +48,45 @@ def fetch_and_store_tickers():
         if supabase:
             # Upsert theo batch để tránh payload quá lớn
             batch_size = 100
+            upserted_count = 0
             for i in range(0, len(records_to_insert), batch_size):
                 batch = records_to_insert[i:i + batch_size]
                 supabase.table("tickers").upsert(batch).execute()
+                upserted_count += len(batch)
             print("Successfully populated the `tickers` table.")
-            return True
+            return {
+                "step": "extract_tickers",
+                "success": True,
+                "records_fetched": len(records_to_insert),
+                "records_upserted": upserted_count,
+                "errors": 0,
+                "error_rate": 0.0,
+            }
         else:
             print("Database not configured. Cannot save tickers.")
-            return False
+            return {
+                "step": "extract_tickers",
+                "success": False,
+                "records_fetched": len(records_to_insert),
+                "records_upserted": 0,
+                "errors": 1,
+                "error_rate": 1.0,
+                "message": "Database not configured.",
+            }
 
     except Exception as e:
         print(f"Error fetching tickers: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return {
+            "step": "extract_tickers",
+            "success": False,
+            "records_fetched": 0,
+            "records_upserted": 0,
+            "errors": 1,
+            "error_rate": 1.0,
+            "message": str(e),
+        }
 
 
 if __name__ == "__main__":
