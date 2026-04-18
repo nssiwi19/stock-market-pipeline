@@ -44,6 +44,16 @@ FIN_FEATURES = [
     "inventory",
     "cogs",
 ]
+LOG_SCALE_FEATURES = {
+    "revenue",
+    "profit_after_tax",
+    "total_assets",
+    "total_liabilities",
+    "owner_equity",
+    "cash_flow_operating",
+    "inventory",
+    "cogs",
+}
 
 
 def _to_float(value) -> float | None:
@@ -53,6 +63,13 @@ def _to_float(value) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _signed_log1p(value: float) -> float:
+    if value == 0:
+        return 0.0
+    sign = 1.0 if value > 0 else -1.0
+    return sign * math.log1p(abs(value))
 
 
 def _fetch_financial_rows(supabase, page_size: int = 1000) -> List[dict]:
@@ -97,7 +114,11 @@ def _aggregate_ticker_financial_vectors(fin_rows: List[dict]) -> Dict[str, Dict[
         for feature, total in feature_sums.items():
             cnt = counts[ticker][feature]
             if cnt > 0:
-                vec[feature] = total / cnt
+                mean_val = total / cnt
+                # Monetary features vary by many orders of magnitude; log-scaling improves similarity stability.
+                if feature in LOG_SCALE_FEATURES:
+                    mean_val = _signed_log1p(mean_val)
+                vec[feature] = mean_val
         if vec:
             vectors[ticker] = vec
     return vectors
@@ -194,7 +215,8 @@ def _infer_financial_industry(ticker: str, fin_model: dict) -> Tuple[str | None,
     if not raw_vec:
         return None, 0.0, "none"
     vec = _standardize_vec(raw_vec, fin_model["means"], fin_model["stds"])
-    if len(vec) < 4:
+    min_features = max(int(os.getenv("INFER_FIN_MIN_FEATURES", "2")), 1)
+    if len(vec) < min_features:
         return None, 0.0, "none"
 
     scores = []
@@ -239,6 +261,7 @@ def infer_and_backfill_ensemble():
     writeback_industry = os.getenv("INFER_WRITEBACK_INDUSTRY", "true").strip().lower() in {
         "1", "true", "yes", "on"
     }
+    dry_run = os.getenv("INFER_DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "on"}
 
     supports_inferred_columns = True
     try:
@@ -281,6 +304,7 @@ def infer_and_backfill_ensemble():
     accepted = 0
     agreed = 0
     used_financial = 0
+    method_counts = Counter()
     for row in missing_rows:
         ticker = row.get("ticker")
         if not ticker:
@@ -290,9 +314,10 @@ def infer_and_backfill_ensemble():
         label, confidence, method = _combine_predictions(text_pred, fin_pred)
         if not label:
             continue
-        if "financial_centroid" in method:
+        method_counts[method] += 1
+        if method in {"fin_only", "ens_conflict_fin", "ens_agree"}:
             used_financial += 1
-        if method.startswith("ensemble_agree"):
+        if method == "ens_agree":
             agreed += 1
 
         payload = {
@@ -323,10 +348,11 @@ def infer_and_backfill_ensemble():
 
     batch_size = 200
     updated = 0
-    for i in range(0, len(updates), batch_size):
-        batch = updates[i:i + batch_size]
-        supabase.table("tickers").upsert(batch, on_conflict="ticker").execute()
-        updated += len(batch)
+    if not dry_run:
+        for i in range(0, len(updates), batch_size):
+            batch = updates[i:i + batch_size]
+            supabase.table("tickers").upsert(batch, on_conflict="ticker").execute()
+            updated += len(batch)
 
     return {
         "success": True,
@@ -335,12 +361,16 @@ def infer_and_backfill_ensemble():
         "missing_rows": len(missing_rows),
         "financial_rows": len(fin_rows),
         "tickers_with_financial_vector": len(ticker_fin_vec_raw),
-        "updated_rows": updated,
+        "updated_rows": updated if not dry_run else 0,
+        "predicted_rows": len(updates),
         "accepted_writeback_rows": accepted,
         "ensemble_agreed_rows": agreed,
         "rows_used_financial_signal": used_financial,
+        "method_counts": dict(method_counts),
         "min_confidence": min_confidence,
         "writeback_industry": writeback_industry,
+        "dry_run": dry_run,
+        "fin_min_features": max(int(os.getenv("INFER_FIN_MIN_FEATURES", "2")), 1),
         "supports_inferred_columns": supports_inferred_columns,
     }
 
