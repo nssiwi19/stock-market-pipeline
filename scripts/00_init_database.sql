@@ -40,13 +40,68 @@ CREATE TABLE IF NOT EXISTS financial_reports (
     report_type VARCHAR(20) NOT NULL, -- 'quarterly' or 'yearly'
     period VARCHAR(20) NOT NULL, -- e.g., 'Q1-2025' or '2025'
     
-    -- Key Metrics (in Billions VND or standard units, standardizing is important)
+    -- Income Statement (ty VND, tru eps va ratios)
     revenue NUMERIC(20, 2),
+    cogs NUMERIC(20, 2),
+    gross_profit NUMERIC(20, 2),
+    financial_income NUMERIC(20, 2),
+    financial_expense NUMERIC(20, 2),
+    interest_expense NUMERIC(20, 2),
+    selling_expense NUMERIC(20, 2),
+    general_admin_expense NUMERIC(20, 2),
+    operating_profit NUMERIC(20, 2),
+    other_income NUMERIC(20, 2),
+    other_expense NUMERIC(20, 2),
+    profit_before_tax NUMERIC(20, 2),
     profit_after_tax NUMERIC(20, 2),
+    parent_profit_after_tax NUMERIC(20, 2),
+    minority_profit NUMERIC(20, 2),
+    depreciation_amortization NUMERIC(20, 2),
+    ebit NUMERIC(20, 2),
+    ebitda NUMERIC(20, 2),
+    eps NUMERIC(20, 4),
+
+    -- Balance Sheet
+    cash_and_cash_equivalents NUMERIC(20, 2),
+    short_term_investments NUMERIC(20, 2),
+    short_term_receivables NUMERIC(20, 2),
+    inventory NUMERIC(20, 2),
+    other_current_assets NUMERIC(20, 2),
+    total_current_assets NUMERIC(20, 2),
+    long_term_receivables NUMERIC(20, 2),
+    fixed_assets NUMERIC(20, 2),
+    investment_properties NUMERIC(20, 2),
+    long_term_assets NUMERIC(20, 2),
     total_assets NUMERIC(20, 2),
+    short_term_debt NUMERIC(20, 2),
+    accounts_payable NUMERIC(20, 2),
+    short_term_liabilities NUMERIC(20, 2),
+    total_short_term_liabilities NUMERIC(20, 2),
+    long_term_debt NUMERIC(20, 2),
+    total_long_term_liabilities NUMERIC(20, 2),
     total_liabilities NUMERIC(20, 2),
+    owner_equity NUMERIC(20, 2),
     equity NUMERIC(20, 2),
-    eps NUMERIC(15, 2),
+    retained_earnings NUMERIC(20, 2),
+    share_capital NUMERIC(20, 2),
+    total_equity_and_liabilities NUMERIC(20, 2),
+
+    -- Cashflow
+    cash_flow_operating NUMERIC(20, 2),
+    cash_flow_investing NUMERIC(20, 2),
+    cash_flow_financing NUMERIC(20, 2),
+    net_cash_flow NUMERIC(20, 2),
+    capex NUMERIC(20, 2),
+
+    -- Ratios
+    gross_margin NUMERIC(20, 6),
+    operating_margin NUMERIC(20, 6),
+    net_margin NUMERIC(20, 6),
+    roe NUMERIC(20, 6),
+    roa NUMERIC(20, 6),
+    debt_to_equity NUMERIC(20, 6),
+    current_ratio NUMERIC(20, 6),
+    asset_turnover NUMERIC(20, 6),
     
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()),
     UNIQUE(ticker, report_type, period)

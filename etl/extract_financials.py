@@ -12,7 +12,9 @@ ThreadPoolExecutor (max_workers=10) + Tenacity retry + Batch upsert.
 
 import json
 import os
+import re
 import time
+import unicodedata
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
@@ -28,6 +30,16 @@ HEADERS = {
 
 CAFEF_INCSTA_URL = "https://s.cafef.vn/bao-cao-tai-chinh/{ticker}/IncSta/{year}/0/0/0/ket-qua-hoat-dong-kinh-doanh-.chn"
 CAFEF_BSHEET_URL = "https://s.cafef.vn/bao-cao-tai-chinh/{ticker}/BSheet/{year}/0/0/0/bang-can-doi-ke-toan-.chn"
+CAFEF_CFLOW_URL = "https://s.cafef.vn/bao-cao-tai-chinh/{ticker}/CashFlow/{year}/0/0/0/luu-chuyen-tien-te-gian-tiep-.chn"
+
+
+def _normalize_text(text: str) -> str:
+    """Lowercase + bỏ dấu tiếng Việt để match keyword ổn định."""
+    if text is None:
+        return ""
+    text = unicodedata.normalize("NFKD", str(text))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(text.lower().strip().split())
 
 
 def _parse_vn_number(text: str) -> float:
@@ -52,8 +64,13 @@ def _find_financial_table(soup: BeautifulSoup):
     best_table = None
     best_rows = 0
     for table in soup.find_all('table'):
-        text = table.get_text().lower()
-        if 'doanh thu' in text or 'tổng cộng tài sản' in text or 'lợi nhuận' in text:
+        text = _normalize_text(table.get_text())
+        if (
+            'doanh thu' in text
+            or 'tong cong tai san' in text
+            or 'loi nhuan' in text
+            or 'luu chuyen tien te' in text
+        ):
             num_rows = len(table.find_all('tr'))
             if num_rows > best_rows:
                 best_rows = num_rows
@@ -61,16 +78,88 @@ def _find_financial_table(soup: BeautifulSoup):
     return best_table
 
 
-def _extract_row_value(rows, keyword: str, col_idx: int = 1) -> float:
-    """Tìm row chứa keyword và trả về giá trị ở cột col_idx."""
+def _extract_row_value(rows, keywords: tuple[str, ...], col_idx: int = 1, scale: float = 1e9) -> float:
+    """Tìm row chứa 1 trong các keyword và trả về giá trị ở cột col_idx."""
     for row in rows:
         cells = row.find_all('td')
         if len(cells) >= 2:
-            label = cells[0].get_text(strip=True).lower()
-            if keyword in label:
+            label = _normalize_text(cells[0].get_text(strip=True))
+            if any(keyword in label for keyword in keywords):
                 if col_idx < len(cells):
-                    return _parse_vn_number(cells[col_idx].get_text(strip=True))
+                    return _parse_vn_number(cells[col_idx].get_text(strip=True)) / scale
     return 0.0
+
+
+def _safe_div(numerator: float, denominator: float) -> float:
+    if denominator in (0, 0.0):
+        return 0.0
+    return numerator / denominator
+
+
+def _extract_period(rows, col_idx: int, fallback_year: int) -> str:
+    """Lấy năm từ header cột; fallback về FY-{fallback_year}."""
+    for row in rows[:5]:
+        cells = row.find_all('td')
+        if col_idx < len(cells):
+            text = cells[col_idx].get_text(" ", strip=True)
+            match = re.search(r"(20\d{2})", text)
+            if match:
+                return f"FY-{match.group(1)}"
+    return f"FY-{fallback_year}"
+
+
+INCOME_METRICS = {
+    "revenue": (("doanh thu thuan",), 1e9),
+    "cogs": (("gia von hang ban",), 1e9),
+    "gross_profit": (("loi nhuan gop",), 1e9),
+    "financial_income": (("doanh thu hoat dong tai chinh",), 1e9),
+    "financial_expense": (("chi phi tai chinh",), 1e9),
+    "interest_expense": (("chi phi lai vay",), 1e9),
+    "selling_expense": (("chi phi ban hang",), 1e9),
+    "general_admin_expense": (("chi phi quan ly doanh nghiep",), 1e9),
+    "operating_profit": (("loi nhuan thuan tu hoat dong kinh doanh",), 1e9),
+    "other_income": (("thu nhap khac",), 1e9),
+    "other_expense": (("chi phi khac",), 1e9),
+    "profit_before_tax": (("tong loi nhuan ke toan truoc thue",), 1e9),
+    "profit_after_tax": (("loi nhuan sau thue thu nhap doanh nghiep",), 1e9),
+    "parent_profit_after_tax": (("loi nhuan sau thue cua cong ty me",), 1e9),
+    "minority_profit": (("loi ich cua co dong khong kiem soat",), 1e9),
+    "depreciation_amortization": (("khau hao tai san co dinh",), 1e9),
+    "eps": (("lai co ban tren co phieu", "eps"), 1.0),
+}
+
+BALANCE_METRICS = {
+    "cash_and_cash_equivalents": (("tien va tuong duong tien",), 1e9),
+    "short_term_investments": (("dau tu tai chinh ngan han",), 1e9),
+    "short_term_receivables": (("cac khoan phai thu ngan han",), 1e9),
+    "inventory": (("hang ton kho",), 1e9),
+    "other_current_assets": (("tai san ngan han khac",), 1e9),
+    "total_current_assets": (("tong tai san ngan han",), 1e9),
+    "long_term_receivables": (("phai thu dai han",), 1e9),
+    "fixed_assets": (("tai san co dinh",), 1e9),
+    "investment_properties": (("bat dong san dau tu",), 1e9),
+    "long_term_assets": (("tai san dai han",), 1e9),
+    "total_assets": (("tong cong tai san",), 1e9),
+    "short_term_debt": (("vay va no thue tai chinh ngan han", "vay ngan han"), 1e9),
+    "accounts_payable": (("phai tra nguoi ban",), 1e9),
+    "short_term_liabilities": (("no ngan han",), 1e9),
+    "total_short_term_liabilities": (("tong no ngan han",), 1e9),
+    "long_term_debt": (("vay va no thue tai chinh dai han", "vay dai han"), 1e9),
+    "total_long_term_liabilities": (("no dai han",), 1e9),
+    "total_liabilities": (("no phai tra",), 1e9),
+    "owner_equity": (("von chu so huu",), 1e9),
+    "retained_earnings": (("loi nhuan sau thue chua phan phoi",), 1e9),
+    "share_capital": (("von gop cua chu so huu",), 1e9),
+    "total_equity_and_liabilities": (("tong cong nguon von",), 1e9),
+}
+
+CASHFLOW_METRICS = {
+    "cash_flow_operating": (("luu chuyen tien thuan tu hoat dong kinh doanh",), 1e9),
+    "cash_flow_investing": (("luu chuyen tien thuan tu hoat dong dau tu",), 1e9),
+    "cash_flow_financing": (("luu chuyen tien thuan tu hoat dong tai chinh",), 1e9),
+    "net_cash_flow": (("luu chuyen tien thuan trong ky",), 1e9),
+    "capex": (("tien chi de mua sam xay dung tscd", "chi mua sam xay dung tai san co dinh"), 1e9),
+}
 
 
 @retry(
@@ -88,57 +177,57 @@ def fetch_single_ticker_financials(ticker: str) -> list[dict]:
     current_year = datetime.now().year
     extracted_records = []
 
-    # === Lấy Income Statement (năm hiện tại → data 3 năm gần nhất) ===
-    url_inc = CAFEF_INCSTA_URL.format(ticker=ticker, year=current_year)
-    resp_inc = requests.get(url_inc, headers=HEADERS, timeout=15)
-    if resp_inc.status_code != 200:
+    def _fetch_rows(url: str) -> list:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        table = _find_financial_table(soup)
+        if not table:
+            return []
+        return table.find_all('tr')
+
+    rows_inc = _fetch_rows(CAFEF_INCSTA_URL.format(ticker=ticker, year=current_year))
+    if not rows_inc:
         return []
 
-    soup_inc = BeautifulSoup(resp_inc.text, 'html.parser')
-    table_inc = _find_financial_table(soup_inc)
+    rows_bs = _fetch_rows(CAFEF_BSHEET_URL.format(ticker=ticker, year=current_year))
+    rows_cf = _fetch_rows(CAFEF_CFLOW_URL.format(ticker=ticker, year=current_year))
 
-    if not table_inc:
-        return []
+    # Cafef thường trả 3-4 cột năm gần nhất.
+    max_cols = 4
+    for col_idx in range(1, max_cols + 1):
+        period_str = _extract_period(rows_inc, col_idx, current_year - col_idx)
+        record = {
+            "ticker": ticker,
+            "report_type": "yearly",
+            "period": period_str,
+        }
 
-    rows_inc = table_inc.find_all('tr')
+        for field, (keywords, scale) in INCOME_METRICS.items():
+            record[field] = _extract_row_value(rows_inc, keywords, col_idx, scale)
+        for field, (keywords, scale) in BALANCE_METRICS.items():
+            record[field] = _extract_row_value(rows_bs, keywords, col_idx, scale) if rows_bs else 0.0
+        for field, (keywords, scale) in CASHFLOW_METRICS.items():
+            record[field] = _extract_row_value(rows_cf, keywords, col_idx, scale) if rows_cf else 0.0
 
-    # === Lấy Balance Sheet ===
-    url_bs = CAFEF_BSHEET_URL.format(ticker=ticker, year=current_year)
-    resp_bs = requests.get(url_bs, headers=HEADERS, timeout=15)
+        record["equity"] = record.get("owner_equity", 0.0)
+        record["ebit"] = record.get("operating_profit", 0.0) + record.get("interest_expense", 0.0)
+        record["ebitda"] = record.get("ebit", 0.0) + record.get("depreciation_amortization", 0.0)
+        record["gross_margin"] = _safe_div(record.get("gross_profit", 0.0), record.get("revenue", 0.0))
+        record["operating_margin"] = _safe_div(record.get("operating_profit", 0.0), record.get("revenue", 0.0))
+        record["net_margin"] = _safe_div(record.get("profit_after_tax", 0.0), record.get("revenue", 0.0))
+        record["roe"] = _safe_div(record.get("profit_after_tax", 0.0), record.get("owner_equity", 0.0))
+        record["roa"] = _safe_div(record.get("profit_after_tax", 0.0), record.get("total_assets", 0.0))
+        record["debt_to_equity"] = _safe_div(record.get("total_liabilities", 0.0), record.get("owner_equity", 0.0))
+        record["current_ratio"] = _safe_div(
+            record.get("total_current_assets", 0.0),
+            record.get("total_short_term_liabilities", 0.0),
+        )
+        record["asset_turnover"] = _safe_div(record.get("revenue", 0.0), record.get("total_assets", 0.0))
 
-    rows_bs = []
-    if resp_bs.status_code == 200:
-        soup_bs = BeautifulSoup(resp_bs.text, 'html.parser')
-        table_bs = _find_financial_table(soup_bs)
-        if table_bs:
-            rows_bs = table_bs.find_all('tr')
-
-    # === Parse 3 cột (3 năm gần nhất) ===
-    for col_idx in range(1, 4):  # Cột 1, 2, 3
-        year = current_year - (col_idx - 1) - 1  # 2025, 2024, 2023
-        period_str = f"FY-{year}"
-
-        # Income Statement
-        revenue = _extract_row_value(rows_inc, 'doanh thu thuần', col_idx) / 1e9  # → tỷ VND
-        profit = _extract_row_value(rows_inc, 'lợi nhuận sau thuế', col_idx) / 1e9
-
-        # Balance Sheet
-        total_assets = _extract_row_value(rows_bs, 'tổng cộng tài sản', col_idx) / 1e9 if rows_bs else 0
-        total_liabilities = _extract_row_value(rows_bs, 'nợ phải trả', col_idx) / 1e9 if rows_bs else 0
-        equity = _extract_row_value(rows_bs, 'vốn chủ sở hữu', col_idx) / 1e9 if rows_bs else 0
-
-        if revenue != 0 or total_assets != 0:
-            extracted_records.append({
-                "ticker": ticker,
-                "report_type": "yearly",
-                "period": period_str,
-                "revenue": revenue,
-                "profit_after_tax": profit,
-                "total_assets": total_assets,
-                "total_liabilities": total_liabilities,
-                "equity": equity,
-                "eps": 0
-            })
+        if record.get("revenue", 0.0) != 0 or record.get("total_assets", 0.0) != 0:
+            extracted_records.append(record)
 
     return extracted_records
 
