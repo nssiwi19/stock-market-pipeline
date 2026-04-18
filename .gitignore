@@ -18,3 +18,4 @@ env/
 # Runtime/debug artifacts
 etl/dead_letter/
 tmp_*
+scripts/output/

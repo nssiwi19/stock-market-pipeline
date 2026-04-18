@@ -1,0 +1,16 @@
+[
+  {"target_contains": "ngan hang", "keywords": ["ngan hang", "bank"]},
+  {"target_contains": "chung khoan", "keywords": ["chung khoan", "securities"]},
+  {"target_contains": "bao hiem", "keywords": ["bao hiem", "insurance"]},
+  {"target_contains": "bat dong san", "keywords": ["bat dong san", "real estate"]},
+  {"target_contains": "dien", "keywords": ["dien luc", "thuy dien", "nhiet dien", "power"]},
+  {"target_contains": "dau khi", "keywords": ["dau khi", "petro", "gas"]},
+  {"target_contains": "thep", "keywords": ["thep", "steel"]},
+  {"target_contains": "duoc", "keywords": ["duoc", "pharma", "pharmaceutical"]},
+  {"target_contains": "thuy san", "keywords": ["thuy san", "thuysan", "seafood"]},
+  {"target_contains": "det may", "keywords": ["det may", "textile", "garment"]},
+  {"target_contains": "van tai", "keywords": ["van tai", "logistics", "transport"]},
+  {"target_contains": "hang khong", "keywords": ["hang khong", "aviation", "airline"]},
+  {"target_contains": "xi mang", "keywords": ["xi mang", "cement"]},
+  {"target_contains": "phan bon", "keywords": ["phan bon", "fertilizer"]}
+]
