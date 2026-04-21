@@ -109,15 +109,45 @@ def _safe_add(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return (a or 0.0) + (b or 0.0)
 
 
-def _extract_period(rows, col_idx: int, fallback_year: int) -> str:
-    """Lấy năm từ header cột; fallback về FY-{fallback_year}."""
-    for row in rows[:5]:
+def _build_column_year_map(rows, max_cols: int, current_year: int) -> dict[int, int]:
+    """
+    Tìm row header chứa nhiều năm nhất và map col_idx -> year.
+    Tránh bug match nhầm năm từ các row nội dung.
+    """
+    best_map: dict[int, int] = {}
+    best_score = -1
+    # Header thường nằm ở đầu bảng; quét rộng hơn 5 dòng để ổn định.
+    for row in rows[:12]:
         cells = row.find_all('td')
-        if col_idx < len(cells):
+        if not cells:
+            continue
+        row_map: dict[int, int] = {}
+        for col_idx in range(1, max_cols + 1):
+            if col_idx >= len(cells):
+                continue
             text = cells[col_idx].get_text(" ", strip=True)
             match = re.search(r"(20\d{2})", text)
-            if match:
-                return f"FY-{match.group(1)}"
+            if not match:
+                continue
+            try:
+                year = int(match.group(1))
+            except ValueError:
+                continue
+            # Bound year range for sanity.
+            if year < 2000 or year > current_year + 1:
+                continue
+            row_map[col_idx] = year
+        if len(row_map) > best_score:
+            best_score = len(row_map)
+            best_map = row_map
+    return best_map
+
+
+def _extract_period(col_idx: int, fallback_year: int, year_map: dict[int, int]) -> str:
+    """Lấy period theo year_map; fallback về FY-{fallback_year}."""
+    year = year_map.get(col_idx)
+    if year is not None:
+        return f"FY-{year}"
     return f"FY-{fallback_year}"
 
 
@@ -209,8 +239,9 @@ def fetch_single_ticker_financials(ticker: str) -> list[dict]:
 
     # Cafef thường trả 3-4 cột năm gần nhất.
     max_cols = 4
+    year_map = _build_column_year_map(rows_inc, max_cols=max_cols, current_year=current_year)
     for col_idx in range(1, max_cols + 1):
-        period_str = _extract_period(rows_inc, col_idx, current_year - col_idx)
+        period_str = _extract_period(col_idx, current_year - col_idx, year_map=year_map)
         record = {
             "ticker": ticker,
             "report_type": "yearly",

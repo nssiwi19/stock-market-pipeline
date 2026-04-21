@@ -320,6 +320,10 @@ def _required_columns_from_question(user_question: str) -> list[str]:
         required.append("net_margin")
     if "debt" in text or "don bay" in text or "no" in text:
         required.append("debt_to_equity")
+    if any(k in text for k in ["rui ro", "rủi ro", "an toan", "an toàn", "it rui ro", "ít rủi ro"]):
+        # For "low-risk" screening, always require a leverage proxy.
+        if "debt_to_equity" not in required:
+            required.append("debt_to_equity")
     return required
 
 
@@ -329,6 +333,39 @@ def _sql_has_required_columns(sql: str, required_columns: list[str]) -> tuple[bo
         if re.search(rf"\b{re.escape(col.lower())}\b", lowered) is None:
             return False, f"SQL missing required column: {col}"
     return True, ""
+
+
+def _question_mentions_banking(user_question: str) -> bool:
+    text = (user_question or "").lower()
+    return any(k in text for k in ["ngân hàng", "ngan hang", "bank", "banking"])
+
+
+def _sql_has_banking_filter(sql: str) -> bool:
+    lowered = (sql or "").lower()
+    # Detect common filtering patterns for industry bank.
+    return (
+        ("industry" in lowered and ("ngan hang" in lowered or "ngân hàng" in lowered or "bank" in lowered))
+        or ("coalesce(industry" in lowered and ("ngan hang" in lowered or "bank" in lowered))
+    )
+
+
+def _is_ranking_question(user_question: str) -> bool:
+    text = (user_question or "").lower()
+    return any(
+        k in text
+        for k in ["tot nhat", "tốt nhất", "cao nhat", "cao nhất", "lon nhat", "lớn nhất", "best", "top"]
+    )
+
+
+def _pick_ranking_metric(required_columns: list[str]) -> str | None:
+    for metric in ["roe", "roa", "net_margin", "profit_after_tax", "volume", "close_price"]:
+        if metric in required_columns:
+            return metric
+    return None
+
+
+def _is_null_like(value) -> bool:
+    return value is None or str(value).strip().lower() in {"none", "null", "nan", ""}
 
 
 def _question_has_explicit_date(user_question: str) -> bool:
@@ -439,6 +476,49 @@ def chatbot_text_to_sql_flow(user_question: str) -> dict:
             }
         safe_sql = revised_or_error
 
+    # Domain guardrail: if question asks for banking sector, force robust bank-industry filter.
+    if _question_mentions_banking(user_question) and not _sql_has_banking_filter(safe_sql):
+        prompt_banking_filter = (
+            "Cau hoi yeu cau pham vi NGAN HANG, nhung SQL hien tai chua co bo loc nganh ngan hang du ro rang. "
+            "Hay sua SQL de chi lay cac ticker thuoc nganh ngan hang bang cach join bang tickers "
+            "va loc industry theo bien the text robust (ngan hang/bank). "
+            "Giu nguyen business intent xep hang va LIMIT.\n"
+            f"Cau hoi: {user_question}\n"
+            f"SQL hien tai: {safe_sql}\n"
+            "Chi tra ve SQL cuoi cung."
+        )
+        banking_text, banking_errors = _call_gemini_text(prompt_banking_filter, temperature=0.0)
+        if not banking_text:
+            return {
+                "success": False,
+                "error": "Cannot enforce banking industry scope",
+                "sql": safe_sql,
+                "rows": [],
+                "answer": "[AI ERROR] Khong the bo sung bo loc nganh ngan hang. "
+                + " | ".join(banking_errors[:3]),
+            }
+        banking_sql = _extract_sql_from_model_text(banking_text)
+        banking_valid, banking_or_error = _validate_readonly_sql(banking_sql)
+        if not banking_valid:
+            return {
+                "success": False,
+                "error": banking_or_error,
+                "sql": banking_sql,
+                "rows": [],
+                "answer": f"[AI ERROR] SQL bo sung bo loc ngan hang khong hop le: {banking_or_error}",
+            }
+        # Ensure required columns are still present.
+        banking_fit_ok, banking_fit_error = _sql_has_required_columns(banking_or_error, required_columns)
+        if not banking_fit_ok:
+            return {
+                "success": False,
+                "error": banking_fit_error,
+                "sql": banking_or_error,
+                "rows": [],
+                "answer": f"[AI ERROR] SQL ngan hang thieu cot bat buoc: {banking_fit_error}",
+            }
+        safe_sql = banking_or_error
+
     # Default guardrail: if question does not specify date but query hits daily_prices,
     # enforce trading_date = latest_date to avoid accidental all-time query.
     if _sql_targets_daily_prices(safe_sql) and not _question_has_explicit_date(user_question) and not _sql_has_trading_date_filter(safe_sql):
@@ -500,6 +580,37 @@ def chatbot_text_to_sql_flow(user_question: str) -> dict:
             "rows": [],
             "answer": f"[DB ERROR] {exc}",
         }
+
+    # Ranking guardrail for financial metrics:
+    # If user asks "best/top" and top row has null metric, regenerate SQL with IS NOT NULL + NULLS LAST.
+    ranking_metric = _pick_ranking_metric(required_columns)
+    if _is_ranking_question(user_question) and ranking_metric and rows:
+        first_row = rows[0] if isinstance(rows[0], dict) else {}
+        if _is_null_like(first_row.get(ranking_metric)):
+            prompt_non_null_rank = (
+                "SQL hien tai tra ve dong dau co metric bi null, khong dung business intent 'top/best'. "
+                f"Hay sua SQL de loai bo null metric {ranking_metric} bang dieu kien `{ranking_metric} IS NOT NULL`, "
+                f"va khi sap xep thi dung `ORDER BY {ranking_metric} DESC NULLS LAST`. "
+                "Giu nguyen intent cau hoi, bang du lieu, bo loc thoi gian, va LIMIT.\n"
+                f"Cau hoi: {user_question}\n"
+                f"SQL hien tai: {safe_sql}\n"
+                "Chi tra ve SQL cuoi cung."
+            )
+            revised_text, revised_errors = _call_gemini_text(prompt_non_null_rank, temperature=0.0)
+            if revised_text:
+                revised_sql = _extract_sql_from_model_text(revised_text)
+                revised_valid, revised_or_error = _validate_readonly_sql(revised_sql)
+                if revised_valid:
+                    try:
+                        revised_rows = _execute_readonly_sql(revised_or_error)
+                        if revised_rows:
+                            safe_sql = revised_or_error
+                            rows = revised_rows
+                    except Exception:
+                        pass
+            else:
+                # Keep current result but allow narrator to expose data limitation.
+                _ = revised_errors
 
     rows_preview = rows[:50]
     sensitive_note = (
