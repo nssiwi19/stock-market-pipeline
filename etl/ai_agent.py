@@ -318,6 +318,17 @@ def _required_columns_from_question(user_question: str) -> list[str]:
         required.append("roa")
     if "net margin" in text or "bien loi nhuan rong" in text:
         required.append("net_margin")
+    if any(
+        k in text
+        for k in [
+            "gross margin",
+            "bien loi nhuan gop",
+            "biên lợi nhuận gộp",
+            "loi nhuan gop",
+            "lợi nhuận gộp",
+        ]
+    ):
+        required.append("gross_margin")
     if "debt" in text or "don bay" in text or "no" in text:
         required.append("debt_to_equity")
     if any(k in text for k in ["rui ro", "rủi ro", "an toan", "an toàn", "it rui ro", "ít rủi ro"]):
@@ -358,7 +369,7 @@ def _is_ranking_question(user_question: str) -> bool:
 
 
 def _pick_ranking_metric(required_columns: list[str]) -> str | None:
-    for metric in ["roe", "roa", "net_margin", "profit_after_tax", "volume", "close_price"]:
+    for metric in ["gross_margin", "roe", "roa", "net_margin", "profit_after_tax", "volume", "close_price"]:
         if metric in required_columns:
             return metric
     return None
