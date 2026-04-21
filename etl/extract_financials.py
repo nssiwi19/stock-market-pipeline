@@ -16,6 +16,7 @@ import re
 import time
 import unicodedata
 from pathlib import Path
+from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -42,10 +43,13 @@ def _normalize_text(text: str) -> str:
     return " ".join(text.lower().strip().split())
 
 
-def _parse_vn_number(text: str) -> float:
+def _parse_vn_number(text: str) -> Optional[float]:
     """Parse số tiền Việt Nam: '60.074.730.223.299' → 60074730223299.0"""
-    if not text or text.strip() in ('-', '', 'N/A', '--', '0'):
-        return 0.0
+    if not text:
+        return None
+    text = text.strip()
+    if text in ('-', '', 'N/A', '--'):
+        return None
     text = text.strip()
     negative = text.startswith('-')
     if negative:
@@ -56,7 +60,7 @@ def _parse_vn_number(text: str) -> float:
         val = float(text)
         return -val if negative else val
     except ValueError:
-        return 0.0
+        return None
 
 
 def _find_financial_table(soup: BeautifulSoup):
@@ -78,7 +82,7 @@ def _find_financial_table(soup: BeautifulSoup):
     return best_table
 
 
-def _extract_row_value(rows, keywords: tuple[str, ...], col_idx: int = 1, scale: float = 1e9) -> float:
+def _extract_row_value(rows, keywords: tuple[str, ...], col_idx: int = 1, scale: float = 1e9) -> Optional[float]:
     """Tìm row chứa 1 trong các keyword và trả về giá trị ở cột col_idx."""
     for row in rows:
         cells = row.find_all('td')
@@ -86,14 +90,23 @@ def _extract_row_value(rows, keywords: tuple[str, ...], col_idx: int = 1, scale:
             label = _normalize_text(cells[0].get_text(strip=True))
             if any(keyword in label for keyword in keywords):
                 if col_idx < len(cells):
-                    return _parse_vn_number(cells[col_idx].get_text(strip=True)) / scale
-    return 0.0
+                    parsed = _parse_vn_number(cells[col_idx].get_text(strip=True))
+                    if parsed is None:
+                        return None
+                    return parsed / scale
+    return None
 
 
-def _safe_div(numerator: float, denominator: float) -> float:
-    if denominator in (0, 0.0):
-        return 0.0
+def _safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator in (None, 0, 0.0):
+        return None
     return numerator / denominator
+
+
+def _safe_add(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None and b is None:
+        return None
+    return (a or 0.0) + (b or 0.0)
 
 
 def _extract_period(rows, col_idx: int, fallback_year: int) -> str:
@@ -207,26 +220,26 @@ def fetch_single_ticker_financials(ticker: str) -> list[dict]:
         for field, (keywords, scale) in INCOME_METRICS.items():
             record[field] = _extract_row_value(rows_inc, keywords, col_idx, scale)
         for field, (keywords, scale) in BALANCE_METRICS.items():
-            record[field] = _extract_row_value(rows_bs, keywords, col_idx, scale) if rows_bs else 0.0
+            record[field] = _extract_row_value(rows_bs, keywords, col_idx, scale) if rows_bs else None
         for field, (keywords, scale) in CASHFLOW_METRICS.items():
-            record[field] = _extract_row_value(rows_cf, keywords, col_idx, scale) if rows_cf else 0.0
+            record[field] = _extract_row_value(rows_cf, keywords, col_idx, scale) if rows_cf else None
 
-        record["equity"] = record.get("owner_equity", 0.0)
-        record["ebit"] = record.get("operating_profit", 0.0) + record.get("interest_expense", 0.0)
-        record["ebitda"] = record.get("ebit", 0.0) + record.get("depreciation_amortization", 0.0)
-        record["gross_margin"] = _safe_div(record.get("gross_profit", 0.0), record.get("revenue", 0.0))
-        record["operating_margin"] = _safe_div(record.get("operating_profit", 0.0), record.get("revenue", 0.0))
-        record["net_margin"] = _safe_div(record.get("profit_after_tax", 0.0), record.get("revenue", 0.0))
-        record["roe"] = _safe_div(record.get("profit_after_tax", 0.0), record.get("owner_equity", 0.0))
-        record["roa"] = _safe_div(record.get("profit_after_tax", 0.0), record.get("total_assets", 0.0))
-        record["debt_to_equity"] = _safe_div(record.get("total_liabilities", 0.0), record.get("owner_equity", 0.0))
+        record["equity"] = record.get("owner_equity")
+        record["ebit"] = _safe_add(record.get("operating_profit"), record.get("interest_expense"))
+        record["ebitda"] = _safe_add(record.get("ebit"), record.get("depreciation_amortization"))
+        record["gross_margin"] = _safe_div(record.get("gross_profit"), record.get("revenue"))
+        record["operating_margin"] = _safe_div(record.get("operating_profit"), record.get("revenue"))
+        record["net_margin"] = _safe_div(record.get("profit_after_tax"), record.get("revenue"))
+        record["roe"] = _safe_div(record.get("profit_after_tax"), record.get("owner_equity"))
+        record["roa"] = _safe_div(record.get("profit_after_tax"), record.get("total_assets"))
+        record["debt_to_equity"] = _safe_div(record.get("total_liabilities"), record.get("owner_equity"))
         record["current_ratio"] = _safe_div(
-            record.get("total_current_assets", 0.0),
-            record.get("total_short_term_liabilities", 0.0),
+            record.get("total_current_assets"),
+            record.get("total_short_term_liabilities"),
         )
-        record["asset_turnover"] = _safe_div(record.get("revenue", 0.0), record.get("total_assets", 0.0))
+        record["asset_turnover"] = _safe_div(record.get("revenue"), record.get("total_assets"))
 
-        if record.get("revenue", 0.0) != 0 or record.get("total_assets", 0.0) != 0:
+        if record.get("revenue") is not None or record.get("total_assets") is not None:
             extracted_records.append(record)
 
     return extracted_records
@@ -261,7 +274,7 @@ def _upsert_with_retry(supabase, table_name: str, batch: list[dict], on_conflict
             last_error = exc
             if attempt < max_attempts:
                 sleep_s = 2 ** (attempt - 1)
-                print(f"⚠️ Upsert {table_name} lỗi (attempt {attempt}/{max_attempts}), retry sau {sleep_s}s: {exc}")
+                print(f"[WARN] Upsert {table_name} failed (attempt {attempt}/{max_attempts}), retry in {sleep_s}s: {exc}")
                 time.sleep(sleep_s)
     return False, last_error
 
@@ -296,8 +309,8 @@ def fetch_and_store_financials():
     max_error_rate = float(os.getenv("PIPELINE_MAX_ERROR_RATE", "0.25"))
     min_processed_before_fail_fast = int(os.getenv("PIPELINE_MIN_ITEMS_FOR_FAIL_FAST", "20"))
 
-    print(f"📊 Bắt đầu cào BCTC (Cafef IncSta + BSheet) cho {len(tickers)} mã...")
-    print(f"🚀 ThreadPoolExecutor(max_workers=10) — 2 req/mã, ~{len(tickers)*2//10}s ETA")
+    print(f"[INFO] Start fetching financial reports (Cafef IncSta + BSheet) for {len(tickers)} tickers...")
+    print(f"[INFO] ThreadPoolExecutor(max_workers=10) - 2 requests/ticker, ~{len(tickers)*2//10}s ETA")
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_ticker = {
@@ -314,15 +327,15 @@ def fetch_and_store_financials():
                     all_financials.extend(records)
             except Exception as exc:
                 error_count += 1
-                print(f"❌ LỖI MÃ {ticker}: {exc}")
+                print(f"[ERROR] Ticker {ticker} failed: {exc}")
 
             count += 1
             current_error_rate = (error_count / count) if count > 0 else 0
             if count >= min_processed_before_fail_fast and current_error_rate > max_error_rate:
                 fail_fast_triggered = True
                 print(
-                    f"🛑 FAIL-FAST: Tỷ lệ lỗi {current_error_rate:.1%} vượt ngưỡng {max_error_rate:.1%} "
-                    f"sau {count} mã."
+                    f"[FAIL-FAST] Error rate {current_error_rate:.1%} exceeded threshold {max_error_rate:.1%} "
+                    f"after {count} tickers."
                 )
                 break
 
@@ -337,11 +350,11 @@ def fetch_and_store_financials():
                 )
                 if success:
                     records_upserted += len(batch)
-                    print(f"✅ Upsert lô BCTC. Tiến độ: {count}/{len(tickers)} | Records: {len(batch)}")
+                    print(f"[OK] Financial batch upserted. Progress: {count}/{len(tickers)} | Records: {len(batch)}")
                 else:
                     failed_batches += 1
                     path = _persist_failed_batch("financial_reports", batch, err)
-                    print(f"💥 Lỗi Supabase sau retry. Đã lưu dead-letter: {path}")
+                    print(f"[ERROR] Supabase upsert failed after retries. Dead-letter saved: {path}")
                 all_financials = all_financials[batch_size:]
 
     if all_financials:
@@ -354,16 +367,16 @@ def fetch_and_store_financials():
         )
         if success:
             records_upserted += len(all_financials)
-            print(f"🏁 Nạp nốt {len(all_financials)} bản ghi cuối.")
+            print(f"[OK] Final batch upserted with {len(all_financials)} records.")
         else:
             failed_batches += 1
             path = _persist_failed_batch("financial_reports", all_financials, err)
-            print(f"💥 Lỗi Supabase lô cuối sau retry. Đã lưu dead-letter: {path}")
+            print(f"[ERROR] Final Supabase upsert failed after retries. Dead-letter saved: {path}")
 
     success_rate = ((count - error_count) / count * 100) if count > 0 else 0
-    print(f"🏁 Hoàn tất. Thành công: {count - error_count}/{count} ({success_rate:.1f}%)")
+    print(f"[DONE] Completed. Success: {count - error_count}/{count} ({success_rate:.1f}%)")
     print(
-        f"📦 Records fetched={records_fetched}, upserted={records_upserted}, "
+        f"[STATS] Records fetched={records_fetched}, upserted={records_upserted}, "
         f"failed_batches={failed_batches}"
     )
 

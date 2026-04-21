@@ -82,6 +82,11 @@ def _is_env_true(env_name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_strict_financials_enabled() -> bool:
+    """Bật strict mode cho step financials để tránh trạng thái green nhưng thiếu dữ liệu."""
+    return _is_env_true("PIPELINE_STRICT_FINANCIALS", default=True)
+
+
 def main():
     vn_tz = timezone(timedelta(hours=7))
     start_time = datetime.now(vn_tz)
@@ -174,8 +179,17 @@ def main():
     results["Extract Financials"] = bool(financials_contract.get("success", False))
 
     if not results["Extract Financials"]:
-        # Nếu lấy BCTC lỗi, chỉ báo cho user biết chứ không dừng pipeline để vẫn xuất được báo cáo giá
-        warn_msg = "⚠️ Cảnh báo: Lấy dữ liệu tài chính (Extract Financials) thất bại. Kiểm tra log."
+        strict_financials = _is_strict_financials_enabled()
+        if strict_financials:
+            error_msg = "❌ Pipeline dừng lại: Extract Financials thất bại."
+            print(f"\n{error_msg}")
+            print(f"   Chi tiết: {financials_contract}")
+            notifier.send_telegram_msg(f"🚨 *Stock Pipeline Alert*\n{error_msg}")
+            sys.exit(1)
+        warn_msg = (
+            "⚠️ Cảnh báo: Extract Financials thất bại nhưng pipeline tiếp tục "
+            "(PIPELINE_STRICT_FINANCIALS=false)."
+        )
         print(f"\n{warn_msg}")
         print(f"   Chi tiết: {financials_contract}")
         notifier.send_telegram_msg(f"🚨 *Stock Pipeline Warning*\n{warn_msg}")

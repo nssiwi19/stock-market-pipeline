@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS daily_prices (
     close_price NUMERIC(15, 2), -- Adjusted Close
     volume BIGINT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()),
+    CONSTRAINT check_price_logic CHECK (
+        low_price <= high_price
+        AND open_price BETWEEN low_price AND high_price
+        AND close_price BETWEEN low_price AND high_price
+        AND volume >= 0
+    ),
     UNIQUE(ticker, trading_date) -- Composite unique constraint to prevent duplicates during upsert
 );
 

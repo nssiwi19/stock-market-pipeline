@@ -148,7 +148,7 @@ def compare_raw_vs_api(ticker: str, ex_date: str):
     ts_to = int(ref_dt.timestamp()) + 86400
 
     url = f"{VPS_BASE_URL}?symbol={ticker}&resolution=D&from={ts_from}&to={ts_to}"
-    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp = requests.get(url, headers=HEADERS, timeout=30)
     data = resp.json()
 
     if data.get('s') == 'ok' and data.get('c'):

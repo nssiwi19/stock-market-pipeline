@@ -52,8 +52,8 @@ def fetch_and_store_tickers():
         df_symbols = listing.all_symbols()
 
         # vnstock3 trả về cột: symbol, organ_name, ...
-        # Lọc sàn HOSE và HNX
-        target_exchanges = ['HOSE', 'HNX']
+        # Lọc sàn HOSE/HNX/UPCOM để tránh hụt universe thị trường Việt Nam.
+        target_exchanges = ['HOSE', 'HNX', 'UPCOM']
         if 'comGroupCode' in df_symbols.columns:
             df_filtered = df_symbols[df_symbols['comGroupCode'].isin(target_exchanges)]
         elif 'exchange' in df_symbols.columns:
@@ -61,7 +61,7 @@ def fetch_and_store_tickers():
         else:
             # Nếu vnstock3 không có cột exchange, lấy tất cả
             df_filtered = df_symbols
-            print(f"  ⚠️ Không tìm thấy cột exchange. Columns: {list(df_symbols.columns)}")
+            print(f"  [WARN] exchange column not found. Columns: {list(df_symbols.columns)}")
 
         supabase = get_supabase_client()
         existing_rows = _fetch_all_existing_tickers(supabase)

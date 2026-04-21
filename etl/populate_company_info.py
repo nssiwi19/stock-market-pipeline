@@ -150,12 +150,12 @@ def _extract_first_non_empty(record: dict, keys: tuple[str, ...]):
     return None
 
 
-def _fetch_overview_enrichment(ticker: str) -> tuple[str, str | None, str | None]:
+def _fetch_overview_enrichment(ticker: str) -> tuple[str, str | None, str | None, str]:
     """Fallback enrichment theo từng mã qua Company.overview()."""
     try:
         df = Company(symbol=ticker).overview()
         if df is None or getattr(df, "empty", True):
-            return ticker, None, None
+            return ticker, None, None, ""
         row = df.iloc[0].to_dict()
         industry = _extract_first_non_empty(
             row,
@@ -177,9 +177,9 @@ def _fetch_overview_enrichment(ticker: str) -> tuple[str, str | None, str | None
                 "exchange_name",
             ),
         )
-        return ticker, industry, exchange
-    except Exception:
-        return ticker, None, None
+        return ticker, industry, exchange, ""
+    except Exception as exc:
+        return ticker, None, None, str(exc)
 
 
 def _is_missing_industry(value) -> bool:
@@ -193,7 +193,9 @@ def _extract_wait_seconds(error_text: str, default_wait: int = 30) -> int:
     """Parse số giây cần chờ từ thông báo rate limit của vnstock."""
     if not error_text:
         return default_wait
-    match = re.search(r"Chờ\s+(\d+)\s+giây", error_text, flags=re.IGNORECASE)
+    match = re.search(r"ch[oơ]\s+(\d+)\s+gi[âa]y", error_text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"wait\s+(\d+)\s+seconds?", error_text, flags=re.IGNORECASE)
     if match:
         try:
             return int(match.group(1))
@@ -205,11 +207,11 @@ def _extract_wait_seconds(error_text: str, default_wait: int = 30) -> int:
 def _fetch_overview_with_retry(ticker: str, max_attempts: int = 2) -> tuple[str, str | None, str | None]:
     """Gọi Company.overview() có xử lý rate limit mềm."""
     for attempt in range(1, max_attempts + 1):
-        t, industry, exchange = _fetch_overview_enrichment(ticker)
+        t, industry, exchange, error_text = _fetch_overview_enrichment(ticker)
         if industry or exchange:
             return t, industry, exchange
         if attempt < max_attempts:
-            wait_s = _extract_wait_seconds("", default_wait=30)
+            wait_s = _extract_wait_seconds(error_text, default_wait=30)
             time.sleep(wait_s)
     return ticker, None, None
 
@@ -313,7 +315,7 @@ def enrich_tickers_with_company_info():
         if len(missing_industry_tickers) > max_fallback_tickers:
             print(
                 f"[ENRICH] Con {len(missing_industry_tickers) - max_fallback_tickers} ma chua enrich o luot nay "
-                f"(giới hạn ENRICH_OVERVIEW_MAX_TICKERS={max_fallback_tickers})."
+                f"(gioi han ENRICH_OVERVIEW_MAX_TICKERS={max_fallback_tickers})."
             )
 
         fallback_map = {}

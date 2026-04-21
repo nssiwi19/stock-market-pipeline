@@ -161,7 +161,7 @@ def _upsert_with_retry(supabase, table_name: str, batch: list[dict], on_conflict
             last_error = exc
             if attempt < max_attempts:
                 sleep_s = 2 ** (attempt - 1)
-                print(f"⚠️ Upsert {table_name} lỗi (attempt {attempt}/{max_attempts}), retry sau {sleep_s}s: {exc}")
+                print(f"[WARN] Upsert {table_name} failed (attempt {attempt}/{max_attempts}), retry in {sleep_s}s: {exc}")
                 time.sleep(sleep_s)
     return False, last_error
 
@@ -200,8 +200,8 @@ def extract_and_upsert_stock_data():
     failed_batches = 0
     fail_fast_triggered = False
 
-    print(f"🚀 Bắt đầu cào dữ liệu giá (DIRECT KBS API) cho {len(tickers)} mã...")
-    print(f"🚀 ThreadPoolExecutor(max_workers=10) — KHÔNG rate limit!")
+    print(f"[INFO] Start fetching daily prices (DIRECT KBS API) for {len(tickers)} tickers...")
+    print("[INFO] ThreadPoolExecutor(max_workers=10) - no rate limit.")
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_ticker = {
@@ -220,15 +220,15 @@ def extract_and_upsert_stock_data():
                 not_found_count += 1
             except Exception as exc:
                 error_count += 1
-                print(f"❌ LỖI MÃ {ticker}: {exc}")
+                print(f"[ERROR] Ticker {ticker} failed: {exc}")
 
             count += 1
             current_error_rate = (error_count / count) if count > 0 else 0
             if count >= min_processed_before_fail_fast and current_error_rate > max_error_rate:
                 fail_fast_triggered = True
                 print(
-                    f"🛑 FAIL-FAST: Tỷ lệ lỗi {current_error_rate:.1%} vượt ngưỡng {max_error_rate:.1%} "
-                    f"sau {count} mã."
+                    f"[FAIL-FAST] Error rate {current_error_rate:.1%} exceeded threshold {max_error_rate:.1%} "
+                    f"after {count} tickers."
                 )
                 break
 
@@ -243,8 +243,8 @@ def extract_and_upsert_stock_data():
                         Exception("Vi phạm check_price_logic (pre-check)"),
                     )
                     print(
-                        f"⚠️ Loại {len(invalid_batch)} rows vi phạm price logic. "
-                        f"Đã lưu dead-letter: {path}"
+                        f"[WARN] Rejected {len(invalid_batch)} rows violating price logic. "
+                        f"Dead-letter saved: {path}"
                     )
 
                 if not valid_batch:
@@ -260,11 +260,11 @@ def extract_and_upsert_stock_data():
                 )
                 if success:
                     records_upserted += len(valid_batch)
-                    print(f"✅ Upsert lô giá. Tiến độ: {count}/{len(tickers)}")
+                    print(f"[OK] Daily price batch upserted. Progress: {count}/{len(tickers)}")
                 else:
                     failed_batches += 1
                     path = _persist_failed_batch("daily_prices", valid_batch, err)
-                    print(f"💥 Lỗi Supabase sau retry. Đã lưu dead-letter: {path}")
+                    print(f"[ERROR] Supabase upsert failed after retries. Dead-letter saved: {path}")
                 all_records = all_records[batch_size:]
 
     # Lô cuối
@@ -279,8 +279,8 @@ def extract_and_upsert_stock_data():
                 Exception("Vi phạm check_price_logic (pre-check)"),
             )
             print(
-                f"⚠️ Loại {len(invalid_batch)} rows vi phạm price logic ở lô cuối. "
-                f"Đã lưu dead-letter: {path}"
+                f"[WARN] Rejected {len(invalid_batch)} rows violating price logic in final batch. "
+                f"Dead-letter saved: {path}"
             )
 
         if valid_batch:
@@ -293,16 +293,16 @@ def extract_and_upsert_stock_data():
             )
             if success:
                 records_upserted += len(valid_batch)
-                print(f"🏁 Nạp nốt {len(valid_batch)} bản ghi cuối.")
+                print(f"[OK] Final batch upserted with {len(valid_batch)} records.")
             else:
                 failed_batches += 1
                 path = _persist_failed_batch("daily_prices", valid_batch, err)
-                print(f"💥 Lỗi Supabase lô cuối sau retry. Đã lưu dead-letter: {path}")
+                print(f"[ERROR] Final Supabase upsert failed after retries. Dead-letter saved: {path}")
 
     success_rate = ((count - error_count) / count * 100) if count > 0 else 0
-    print(f"🏁 Hoàn tất. Thành công: {count - error_count}/{count} ({success_rate:.1f}%)")
+    print(f"[DONE] Completed. Success: {count - error_count}/{count} ({success_rate:.1f}%)")
     print(
-        f"📦 Records fetched={records_fetched}, upserted={records_upserted}, "
+        f"[STATS] Records fetched={records_fetched}, upserted={records_upserted}, "
         f"rejected_records={rejected_records}, failed_batches={failed_batches}, not_found={not_found_count}"
     )
 
