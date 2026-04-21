@@ -21,3 +21,25 @@ graph TD;
     style A fill:#f9f,stroke:#333,stroke-width:2px
     style C fill:#00bfff,stroke:#333,stroke-width:2px
     style D fill:#fbbf24,stroke:#333,stroke-width:2px
+
+## Telegram Q&A Bot (Text-to-SQL)
+
+Run interactive Q&A bot (polling mode):
+
+```bash
+python scripts/telegram_qa_bot.py
+```
+
+Required setup:
+- Apply `scripts/04_create_execute_readonly_sql_rpc.sql` on Supabase.
+- Configure `.env` keys:
+  - `TELEGRAM_BOT_TOKEN`
+  - `TELEGRAM_CHAT_ID` (optional allow-list, recommended)
+  - `GEMINI_API_KEY`
+
+Audit log:
+- Bot writes per-question audit to `logs/telegram_qa_audit.jsonl` with:
+  - `question`
+  - `generated_sql`
+  - `row_count`
+  - `answer`

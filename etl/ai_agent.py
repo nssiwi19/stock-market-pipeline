@@ -1,10 +1,84 @@
 # File: etl/ai_agent.py
 import os
+import json
+import re
 import requests
 from dotenv import load_dotenv
 from .config import get_supabase_client
 
 load_dotenv()
+
+PROMPT_SQL_PLANNER = """
+[ROLE]
+Ban la Senior Financial Data Analyst + PostgreSQL Translator cho thi truong chung khoan Viet Nam.
+
+[MISSION]
+Tu cau hoi nguoi dung, tao DUY NHAT 1 cau SQL PostgreSQL de truy van du lieu chinh xac.
+
+[HARD RULES]
+- Chi tra ve SQL thuan, khong markdown, khong giai thich.
+- Chi cho phep SELECT hoac WITH ... SELECT.
+- Chi dung bang: daily_prices, financial_reports, tickers.
+- Khong dung INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE...
+- Neu cau hoi theo ngay => dung trading_date.
+- Neu hoi "lai nhat":
+  1) profit_after_tax (tuyet doi), 2) roe, 3) net_margin.
+- Neu khong chi ro ky bao cao tai chinh:
+  report_type='yearly' va period moi nhat.
+- Cau hoi co "lon nhat/nho nhat/top" phai co ORDER BY + LIMIT.
+- Neu cau hoi co "volume/khoi luong", SELECT bat buoc co cot volume.
+- Neu cau hoi co "gia", uu tien close_price (hoac open/high/low dung ngu canh).
+- Tranh SELECT *.
+
+[SCHEMA]
+{schema_definition}
+
+[USER QUESTION]
+{user_question}
+"""
+
+PROMPT_SQL_CRITIC = """
+Ban la SQL Reviewer.
+
+Dau vao:
+- Cau hoi: {user_question}
+- SQL de xuat: {candidate_sql}
+- Cac cot bat buoc neu co: {required_columns}
+
+Nhiem vu:
+1) Kiem tra SQL co tra loi truc tiep cau hoi khong.
+2) Kiem tra SQL co thieu metric/cot bat buoc khong.
+3) Kiem tra SQL co an toan read-only khong.
+4) Neu chua dat, sua lai SQL.
+5) Chi tra ve SQL cuoi cung, khong giai thich.
+"""
+
+PROMPT_ANALYST_NARRATOR = """
+[ROLE]
+Ban la chuyen gia phan tich tai chinh trung lap tai Viet Nam.
+
+[INPUT]
+- Cau hoi user: {user_question}
+- SQL da chay: {safe_sql}
+- Du lieu tra ve (JSON): {rows_json}
+- Canh bao: {sensitive_note}
+
+[OUTPUT REQUIREMENTS]
+- Chi dung du lieu da cho, khong suy dien ngoai du lieu.
+- Neu du lieu thieu, noi ro gioi han du lieu.
+- Dung thuat ngu nghiep vu.
+- Khong khuyen nghi mua/ban truc tiep.
+- Neu co du lieu, trich 2-4 con so then chot.
+- Toi da 180 tu.
+
+[FORMAT]
+[Tom tat du kien]
+- ...
+[Phan tich trung lap]
+- ...
+[Rui ro/Gioi han du lieu]
+- ...
+"""
 
 
 def _extract_ai_text(result_json: dict) -> str | None:
@@ -66,6 +140,391 @@ def _build_candidate_models(api_key: str) -> list[str]:
         seen.add(model)
         ordered.append(model)
     return ordered
+
+
+def _call_gemini_text(prompt: str, temperature: float = 0.35) -> tuple[str | None, list[str]]:
+    """Call Gemini and return plain text response + error traces."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None, ["GEMINI_API_KEY is missing"]
+    max_attempts = int(os.getenv("GEMINI_CALL_MAX_ATTEMPTS", "3"))
+    request_timeout_s = int(os.getenv("GEMINI_CALL_TIMEOUT_SECONDS", "30"))
+    retry_base_sleep_s = float(os.getenv("GEMINI_RETRY_BASE_SLEEP_SECONDS", "1.5"))
+
+    candidate_models = _build_candidate_models(api_key)
+    if not candidate_models:
+        return None, ["No generateContent model discovered from ListModels"]
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature},
+    }
+    headers = {"Content-Type": "application/json"}
+
+    errors = []
+    for model_name in candidate_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=request_timeout_s)
+                if response.status_code == 200:
+                    result = response.json()
+                    ai_text = _extract_ai_text(result)
+                    if ai_text:
+                        return ai_text, errors
+                    errors.append(f"{model_name}: response has no valid text")
+                    break
+                if response.status_code == 404:
+                    errors.append(f"{model_name}: 404 model not found")
+                    break
+                # Retry transient limits/availability
+                if response.status_code in (408, 429, 500, 502, 503, 504) and attempt < max_attempts:
+                    sleep_s = retry_base_sleep_s * (2 ** (attempt - 1))
+                    errors.append(
+                        f"{model_name}: transient HTTP {response.status_code}, retry {attempt}/{max_attempts} in {sleep_s:.1f}s"
+                    )
+                    import time
+                    time.sleep(sleep_s)
+                    continue
+                errors.append(f"{model_name}: HTTP {response.status_code} - {response.text[:200]}")
+                break
+            except requests.exceptions.Timeout:
+                if attempt < max_attempts:
+                    sleep_s = retry_base_sleep_s * (2 ** (attempt - 1))
+                    errors.append(
+                        f"{model_name}: timeout, retry {attempt}/{max_attempts} in {sleep_s:.1f}s"
+                    )
+                    import time
+                    time.sleep(sleep_s)
+                    continue
+                errors.append(f"{model_name}: timeout after {max_attempts} attempts")
+                break
+            except requests.exceptions.ConnectionError as exc:
+                if attempt < max_attempts:
+                    sleep_s = retry_base_sleep_s * (2 ** (attempt - 1))
+                    errors.append(
+                        f"{model_name}: connection error ({exc}), retry {attempt}/{max_attempts} in {sleep_s:.1f}s"
+                    )
+                    import time
+                    time.sleep(sleep_s)
+                    continue
+                errors.append(f"{model_name}: connection error - {exc}")
+                break
+            except Exception as exc:
+                errors.append(f"{model_name}: unexpected error - {exc}")
+                break
+    return None, errors
+
+
+def _load_data_dictionary_text() -> str:
+    """Load DATA_DICTIONARY.md to ground SQL generation."""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dict_path = os.path.join(project_root, "DATA_DICTIONARY.md")
+    try:
+        with open(data_dict_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return (
+            "Tables: tickers(ticker,exchange,industry,company_name), "
+            "daily_prices(ticker,trading_date,open_price,high_price,low_price,close_price,volume), "
+            "financial_reports(ticker,report_type,period,revenue,profit_after_tax,roe,roa,debt_to_equity,"
+            "net_margin,gross_margin,operating_margin,cash_flow_operating,interest_expense)."
+        )
+
+
+def _extract_sql_from_model_text(model_text: str) -> str:
+    """Extract SQL from markdown fences or plain text."""
+    if not model_text:
+        return ""
+    text = model_text.strip()
+    match = re.search(r"```(?:sql)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    if match:
+        text = match.group(1).strip()
+    return text.strip()
+
+
+def _validate_readonly_sql(sql: str) -> tuple[bool, str]:
+    """Strict validation for read-only, single-statement SQL."""
+    if not sql:
+        return False, "SQL is empty"
+    normalized = sql.strip()
+    normalized = re.sub(r";+\s*$", "", normalized)
+    if ";" in normalized:
+        return False, "Only one SQL statement is allowed"
+    if not re.match(r"^(select|with)\s", normalized, flags=re.IGNORECASE):
+        return False, "Only SELECT/CTE queries are allowed"
+
+    forbidden = (
+        "insert", "update", "delete", "drop", "alter", "create", "truncate",
+        "grant", "revoke", "comment", "copy", "vacuum", "analyze", "refresh", "call", "do",
+    )
+    if re.search(r"\b(" + "|".join(forbidden) + r")\b", normalized, flags=re.IGNORECASE):
+        return False, "Detected forbidden keyword for non-readonly operation"
+
+    if re.search(r"\b(pg_|information_schema)\w*", normalized, flags=re.IGNORECASE):
+        return False, "System catalog access is not allowed"
+
+    if not re.search(r"\b(daily_prices|financial_reports|tickers)\b", normalized, flags=re.IGNORECASE):
+        return False, "Query must target allowed business tables"
+
+    return True, normalized
+
+
+def _execute_readonly_sql(sql: str) -> list[dict]:
+    """
+    Execute read-only SQL through Supabase RPC.
+    Requires DB function: public.execute_readonly_sql(p_sql text).
+    """
+    client = get_supabase_client()
+    try:
+        resp = client.rpc("execute_readonly_sql", {"p_sql": sql}).execute()
+    except Exception as exc:
+        raise RuntimeError(
+            "RPC execute_readonly_sql not available or failed. "
+            "Apply migration scripts/04_create_execute_readonly_sql_rpc.sql first."
+        ) from exc
+
+    data = resp.data or []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    rows = []
+    for item in data:
+        # Many RPC implementations return jsonb as {"to_jsonb": {...}} or directly dict.
+        if isinstance(item, dict) and "to_jsonb" in item and isinstance(item["to_jsonb"], dict):
+            rows.append(item["to_jsonb"])
+        elif isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
+def _is_sensitive_investment_question(user_question: str) -> bool:
+    text = (user_question or "").lower()
+    return any(k in text for k in ["nen mua", "nen ban", "co nen", "dau tu", "all-in", "chot loi"])
+
+
+def _required_columns_from_question(user_question: str) -> list[str]:
+    text = (user_question or "").lower()
+    required = []
+    if any(k in text for k in ["volume", "khoi luong", "thanh khoan"]):
+        required.append("volume")
+    if "gia" in text:
+        required.append("close_price")
+    if "roe" in text:
+        required.append("roe")
+    if "roa" in text:
+        required.append("roa")
+    if "net margin" in text or "bien loi nhuan rong" in text:
+        required.append("net_margin")
+    if "debt" in text or "don bay" in text or "no" in text:
+        required.append("debt_to_equity")
+    return required
+
+
+def _sql_has_required_columns(sql: str, required_columns: list[str]) -> tuple[bool, str]:
+    lowered = (sql or "").lower()
+    for col in required_columns:
+        if re.search(rf"\b{re.escape(col.lower())}\b", lowered) is None:
+            return False, f"SQL missing required column: {col}"
+    return True, ""
+
+
+def _question_has_explicit_date(user_question: str) -> bool:
+    text = (user_question or "").lower()
+    if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", text):
+        return True
+    if re.search(r"\b\d{1,2}/\d{1,2}/20\d{2}\b", text):
+        return True
+    if any(k in text for k in ["hôm nay", "hom nay", "hôm qua", "hom qua", "latest", "gần nhất", "gan nhat"]):
+        return True
+    return False
+
+
+def _sql_targets_daily_prices(sql: str) -> bool:
+    return re.search(r"\bdaily_prices\b", (sql or "").lower()) is not None
+
+
+def _sql_has_trading_date_filter(sql: str) -> bool:
+    lowered = (sql or "").lower()
+    # Accept common date filter styles.
+    return re.search(
+        r"\btrading_date\b\s*(=|>|<|>=|<=|between|in)\b|\bwhere\b[\s\S]*\btrading_date\b",
+        lowered,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def chatbot_text_to_sql_flow(user_question: str) -> dict:
+    """
+    Text-to-SQL Agent (3 phases):
+    1) NL question -> SQL
+    2) SQL execution on Supabase
+    3) Raw rows -> analyst-style neutral answer
+    """
+    if not user_question or not user_question.strip():
+        return {
+            "success": False,
+            "error": "Question is empty",
+            "sql": None,
+            "rows": [],
+            "answer": "Vui long nhap cau hoi.",
+        }
+
+    schema_definition = _load_data_dictionary_text()
+    prompt_sql = PROMPT_SQL_PLANNER.format(
+        schema_definition=schema_definition,
+        user_question=user_question,
+    )
+    required_columns = _required_columns_from_question(user_question)
+    raw_sql_text, sql_errors = _call_gemini_text(prompt_sql, temperature=0.0)
+    if not raw_sql_text:
+        return {
+            "success": False,
+            "error": "Failed to generate SQL",
+            "sql": None,
+            "rows": [],
+            "answer": "[AI ERROR] Khong sinh duoc SQL. " + " | ".join(sql_errors[:3]),
+        }
+
+    extracted_sql = _extract_sql_from_model_text(raw_sql_text)
+    is_valid, sql_or_error = _validate_readonly_sql(extracted_sql)
+    if not is_valid:
+        return {
+            "success": False,
+            "error": sql_or_error,
+            "sql": extracted_sql,
+            "rows": [],
+            "answer": f"[AI ERROR] SQL khong hop le: {sql_or_error}",
+        }
+    safe_sql = sql_or_error
+
+    # Fitness check: if missing required business columns, ask critic to regenerate once.
+    fit_ok, fit_error = _sql_has_required_columns(safe_sql, required_columns)
+    if not fit_ok:
+        prompt_critic = PROMPT_SQL_CRITIC.format(
+            user_question=user_question,
+            candidate_sql=safe_sql,
+            required_columns=", ".join(required_columns) if required_columns else "(none)",
+        )
+        critic_text, critic_errors = _call_gemini_text(prompt_critic, temperature=0.0)
+        if not critic_text:
+            return {
+                "success": False,
+                "error": fit_error,
+                "sql": safe_sql,
+                "rows": [],
+                "answer": "[AI ERROR] SQL chua dat business intent va khong regenerate duoc. "
+                + " | ".join(critic_errors[:3]),
+            }
+        revised_sql = _extract_sql_from_model_text(critic_text)
+        revised_valid, revised_or_error = _validate_readonly_sql(revised_sql)
+        if not revised_valid:
+            return {
+                "success": False,
+                "error": revised_or_error,
+                "sql": revised_sql,
+                "rows": [],
+                "answer": f"[AI ERROR] SQL sau critic khong hop le: {revised_or_error}",
+            }
+        revised_fit_ok, revised_fit_error = _sql_has_required_columns(revised_or_error, required_columns)
+        if not revised_fit_ok:
+            return {
+                "success": False,
+                "error": revised_fit_error,
+                "sql": revised_or_error,
+                "rows": [],
+                "answer": f"[AI ERROR] SQL sau critic van chua dat: {revised_fit_error}",
+            }
+        safe_sql = revised_or_error
+
+    # Default guardrail: if question does not specify date but query hits daily_prices,
+    # enforce trading_date = latest_date to avoid accidental all-time query.
+    if _sql_targets_daily_prices(safe_sql) and not _question_has_explicit_date(user_question) and not _sql_has_trading_date_filter(safe_sql):
+        prompt_latest_date = (
+            "Ban can sua SQL de them filter trading_date = (SELECT MAX(trading_date) FROM daily_prices) "
+            "neu query dung daily_prices ma cau hoi khong noi ro ngay. "
+            "Giu nguyen business intent va cac cot bat buoc.\n"
+            f"Cau hoi: {user_question}\n"
+            f"SQL hien tai: {safe_sql}\n"
+            f"Cot bat buoc: {', '.join(required_columns) if required_columns else '(none)'}\n"
+            "Chi tra ve SQL cuoi cung."
+        )
+        latest_text, latest_errors = _call_gemini_text(prompt_latest_date, temperature=0.0)
+        if not latest_text:
+            return {
+                "success": False,
+                "error": "Cannot enforce latest trading_date",
+                "sql": safe_sql,
+                "rows": [],
+                "answer": "[AI ERROR] Khong the bo sung filter latest trading_date. "
+                + " | ".join(latest_errors[:3]),
+            }
+        latest_sql = _extract_sql_from_model_text(latest_text)
+        latest_valid, latest_or_error = _validate_readonly_sql(latest_sql)
+        if not latest_valid:
+            return {
+                "success": False,
+                "error": latest_or_error,
+                "sql": latest_sql,
+                "rows": [],
+                "answer": f"[AI ERROR] SQL bo sung latest_date khong hop le: {latest_or_error}",
+            }
+        latest_fit_ok, latest_fit_error = _sql_has_required_columns(latest_or_error, required_columns)
+        if not latest_fit_ok:
+            return {
+                "success": False,
+                "error": latest_fit_error,
+                "sql": latest_or_error,
+                "rows": [],
+                "answer": f"[AI ERROR] SQL latest_date thieu cot bat buoc: {latest_fit_error}",
+            }
+        if not _sql_has_trading_date_filter(latest_or_error):
+            return {
+                "success": False,
+                "error": "latest_date filter is still missing",
+                "sql": latest_or_error,
+                "rows": [],
+                "answer": "[AI ERROR] SQL sau enforce van thieu dieu kien trading_date.",
+            }
+        safe_sql = latest_or_error
+
+    try:
+        rows = _execute_readonly_sql(safe_sql)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "sql": safe_sql,
+            "rows": [],
+            "answer": f"[DB ERROR] {exc}",
+        }
+
+    rows_preview = rows[:50]
+    sensitive_note = (
+        "User question co tinh chat khuyen nghi dau tu. "
+        "Bat buoc tra loi theo huong screening trung lap, neu ro rui ro, KHONG dua lenh mua/ban."
+        if _is_sensitive_investment_question(user_question)
+        else "Tra loi trung lap va data-driven."
+    )
+    prompt_answer = PROMPT_ANALYST_NARRATOR.format(
+        user_question=user_question,
+        safe_sql=safe_sql,
+        rows_json=json.dumps(rows_preview, ensure_ascii=False),
+        sensitive_note=sensitive_note,
+    )
+    final_answer, answer_errors = _call_gemini_text(prompt_answer, temperature=0.25)
+    if not final_answer:
+        final_answer = "[AI ERROR] Khong tong hop duoc cau tra loi. " + " | ".join(answer_errors[:3])
+
+    return {
+        "success": True,
+        "error": None,
+        "sql": safe_sql,
+        "rows": rows_preview,
+        "answer": final_answer,
+    }
 
 
 def _build_market_data_context(df_top) -> str:
@@ -285,37 +744,8 @@ Yeu cau bat buoc:
 - Neu du lieu han che, phai neu ro gia dinh va gioi han du lieu.
 """
     
-    # 3. Gửi yêu cầu qua Gemini API với model discovery để tránh hardcode model chết.
-    candidate_models = _build_candidate_models(api_key)
-    if not candidate_models:
-        return "[AI ERROR] Khong lay duoc danh sach model kha dung tu Gemini ListModels."
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.35}
-    }
-    headers = {'Content-Type': 'application/json'}
-
-    errors = []
-    for model_name in candidate_models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=20)
-            if response.status_code == 200:
-                result = response.json()
-                ai_text = _extract_ai_text(result)
-                if ai_text:
-                    return f"Goc nhin AI (Trung lap):\n{ai_text}"
-                errors.append(f"{model_name}: response has no valid text")
-                continue
-
-            # 404 model not found -> try next model
-            if response.status_code == 404:
-                errors.append(f"{model_name}: 404 model not found")
-                continue
-
-            errors.append(f"{model_name}: HTTP {response.status_code} - {response.text[:200]}")
-        except Exception as e:
-            errors.append(f"{model_name}: connection error - {e}")
-
+    # 3. Call Gemini
+    ai_text, errors = _call_gemini_text(prompt, temperature=0.35)
+    if ai_text:
+        return f"Goc nhin AI (Trung lap):\n{ai_text}"
     return "[AI ERROR] Khong goi duoc model phu hop. " + " | ".join(errors[:3])
