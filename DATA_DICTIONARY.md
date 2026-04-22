@@ -50,6 +50,8 @@ Tai lieu nay mo ta y nghia va don vi cac truong chinh trong Supabase cho du an `
 | `report_type` | `VARCHAR(20)` | - | `yearly` hoac `quarterly` |
 | `period` | `VARCHAR(20)` | - | Ky bao cao (`FY-2025`, `Q1-2025`, ...) |
 | `created_at` | `TIMESTAMPTZ` | UTC | Thoi diem ghi nhan |
+| `source` | `TEXT` | - | Nguon du lieu goc (`cafef_requests`, `vietstock_financeinfo`, `vietstock_bctc_documents`, ...) |
+| `confidence` | `NUMERIC` | 0-1 | Do tin cay record tong hop |
 
 ### Income Statement (ty VND, tru `eps`)
 
@@ -82,3 +84,61 @@ Tai lieu nay mo ta y nghia va don vi cac truong chinh trong Supabase cho du an `
 - Khi hien thi `%`, can nhan `100` cho cac cot ratio (vd `net_margin`).
 - Nen dung `COALESCE(industry, industry_inferred)` trong dashboard phan tich nganh neu can mo rong coverage.
 - Khong thay `NULL` bang `0` cho cot tien te neu nguon khong co du lieu (de tranh sai nghia nghiep vu).
+
+## Bang `financial_reports_bi_gold`
+
+Bang "vang" cho BI, da loc OCR/untrusted, da dung rule sanity va bo sung score chat luong.
+
+| Column | Type | Unit | Mo ta |
+|---|---|---|---|
+| `ticker` | `TEXT` | - | Ma CK |
+| `industry` | `TEXT` | - | Nganh goc |
+| `industry_normalized` | `TEXT` | - | Nganh chuan hoa de aggregate (vd gom nhom Ngan hang) |
+| `report_type` | `TEXT` | - | `yearly` hoac `quarterly` |
+| `period` | `TEXT` | - | Ky bao cao |
+| `period_year` | `INT` | nam | Nam trich tu `period` |
+| `source` | `TEXT` | - | Chuoi nguon dong gop |
+| `source_tier` | `TEXT` | - | Nhom nguon (`trusted_tagged`, `legacy_unknown`, `rejected`) |
+| `confidence` | `NUMERIC` | 0-1 | Do tin cay |
+| `revenue` | `NUMERIC` | ty VND | Doanh thu thuần |
+| `profit_after_tax` | `NUMERIC` | ty VND | LNST |
+| `eps` | `NUMERIC` | VND/co phieu | EPS da qua rule sanity |
+| `gross_margin` | `NUMERIC` | decimal | Bien loi nhuan gop |
+| `net_margin` | `NUMERIC` | decimal | Bien loi nhuan rong |
+| `roe` | `NUMERIC` | decimal | LNST/Von chu |
+| `roa` | `NUMERIC` | decimal | LNST/Tong tai san |
+| `quality_score` | `INT` | 0-100 | Diem tong hop |
+| `quality_score_revenue` | `INT` | 0-100 | Diem phu hop chart doanh thu |
+| `quality_score_profit` | `INT` | 0-100 | Diem phu hop chart loi nhuan |
+| `quality_note` | `TEXT` | - | `excellent`, `good`, `fair`, `weak` |
+| `is_latest_yearly` | `BOOLEAN` | - | Co phai dong yearly moi nhat cua ma |
+| `bi_ready_revenue` | `BOOLEAN` | - | Du dieu kien vao chart doanh thu |
+| `bi_ready_profit` | `BOOLEAN` | - | Du dieu kien vao chart loi nhuan |
+| `refreshed_at` | `TIMESTAMPTZ` | UTC | Lan refresh gan nhat |
+
+## Bang `financial_reports_bi_gold_latest_yearly`
+
+Bang materialized boi function refresh, gom 1 dong latest yearly cho moi ma.
+
+- Muc dich: dung drill-down, table detail tren dashboard.
+- Khoa chinh: `ticker`.
+- Nguon: duoc tao tu `financial_reports_bi_gold` voi dieu kien `is_latest_yearly = true`.
+
+## Bang `financial_reports_bi_gold_industry_agg`
+
+Bang aggregate theo nganh de ve chart top nhanh va on dinh.
+
+| Column | Type | Mo ta |
+|---|---|---|
+| `industry_normalized` | `TEXT` | Nganh chuan hoa |
+| `metric` | `TEXT` | `revenue` hoac `profit` |
+| `ticker_count` | `INT` | So ma dong gop vao tong |
+| `total_value_bn` | `NUMERIC` | Tong gia tri theo metric (ty VND) |
+| `min_ticker_gate` | `BOOLEAN` | Co dat nguong `ticker_count >= 5` |
+| `refreshed_at` | `TIMESTAMPTZ` | Thoi diem cap nhat |
+
+## Bang nen dung de ve BI
+
+- Uu tien 1: `financial_reports_bi_gold_industry_agg` (chart top nganh).
+- Uu tien 2: `financial_reports_bi_gold_latest_yearly` (drill-down theo ma).
+- Han che dung truc tiep `financial_reports` cho dashboard final.
