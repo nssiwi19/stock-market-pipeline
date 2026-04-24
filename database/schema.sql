@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS tickers (
     exchange VARCHAR(10) NOT NULL, -- HOSE or HNX
     industry VARCHAR(255),
     company_name TEXT,
+    contact_phone VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now())
 );
 

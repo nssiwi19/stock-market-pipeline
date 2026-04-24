@@ -427,12 +427,19 @@ def _norm_text(text: str | None) -> str:
 
 
 def _vietstock_unit_to_scale(unit_code: str | None) -> float:
-    unit = (unit_code or "").strip().upper()
+    unit_raw = (unit_code or "").strip()
+    unit = unit_raw.upper()
+    unit_norm = _norm_text(unit_raw)
     # financial_reports monetary fields are stored in "ty dong" (billion VND)
-    if unit in {"HN", "NGHIN", "THOUSAND"}:
+    if unit in {"HN", "NGHIN", "THOUSAND"} or "nghin" in unit_norm or "thousand" in unit_norm:
         return 1_000_000.0
-    if unit in {"TR", "TRIEU", "MILLION"}:
+    # Vietstock often returns "ĐL"/"DL" for values represented in million VND.
+    if unit in {"TR", "TRIEU", "MILLION", "ĐL", "DL"} or "trieu" in unit_norm or "million" in unit_norm:
         return 1_000.0
+    if unit in {"TY", "TỶ", "BILLION"} or "ty dong" in unit_norm or "billion" in unit_norm:
+        return 1.0
+    if unit in {"DONG", "VND"} or unit_norm in {"dong", "vnd"}:
+        return 1_000_000_000.0
     return 1.0
 
 
@@ -480,6 +487,43 @@ def _extract_vietstock_ratio(ratio_rows: list[dict[str, Any]], value_key: str, k
     return val / 100.0 if val > 1 else val
 
 
+def _vietstock_period_sort_key(period_obj: dict[str, Any]) -> tuple[int, int]:
+    year = period_obj.get("YearPeriod")
+    try:
+        y = int(year)
+    except (TypeError, ValueError):
+        y = -1
+    row_no = period_obj.get("Row")
+    try:
+        r = int(row_no)
+    except (TypeError, ValueError):
+        r = 10_000
+    return (y, r)
+
+
+def _value_key_for_period(
+    period_obj: dict[str, Any],
+    *,
+    original_idx: int,
+    period_count: int,
+) -> str:
+    """
+    Vietstock returns `periods` ordered by year (old -> new),
+    but Value1..ValueN are aligned by Row=1..N (new -> old).
+    Prefer explicit Row mapping; fallback to reverse-index heuristic.
+    """
+    row_no = period_obj.get("Row")
+    try:
+        row_idx = int(row_no)
+    except (TypeError, ValueError):
+        row_idx = 0
+    if row_idx > 0:
+        return f"Value{row_idx}"
+    if period_count > 0:
+        return f"Value{period_count - original_idx}"
+    return f"Value{original_idx + 1}"
+
+
 def fetch_from_vietstock_financeinfo(ticker: str) -> list[dict[str, Any]]:
     session = requests.Session()
     token_resp = session.get(VIETSTOCK_TOKEN_URL, headers=VIETSTOCK_HEADERS, timeout=25)
@@ -518,11 +562,14 @@ def fetch_from_vietstock_financeinfo(ticker: str) -> list[dict[str, Any]]:
         return []
 
     out: list[dict[str, Any]] = []
-    max_cols = min(4, len(periods))
-    for idx in range(max_cols):
-        p = periods[idx] if idx < len(periods) else {}
-        value_key = f"Value{idx + 1}"
+    valid_periods = [p for p in periods if isinstance(p, dict) and p.get("YearPeriod") is not None]
+    valid_periods.sort(key=_vietstock_period_sort_key)
+    selected_periods = valid_periods[-4:]
+    period_count = len(valid_periods)
+    for p in selected_periods:
         year = p.get("YearPeriod")
+        original_idx = valid_periods.index(p)
+        value_key = _value_key_for_period(p, original_idx=original_idx, period_count=period_count)
         if year is None:
             continue
         period = str(year)

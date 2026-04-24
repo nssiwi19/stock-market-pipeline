@@ -22,7 +22,7 @@ def _fetch_all_existing_tickers(supabase, page_size: int = 1000) -> list[dict]:
     while True:
         res = (
             supabase.table("tickers")
-            .select("ticker,industry,exchange,company_name")
+            .select("ticker,industry,exchange,company_name,contact_phone")
             .range(offset, offset + page_size - 1)
             .execute()
         )
@@ -150,12 +150,25 @@ def _extract_first_non_empty(record: dict, keys: tuple[str, ...]):
     return None
 
 
-def _fetch_overview_enrichment(ticker: str) -> tuple[str, str | None, str | None, str]:
+def _normalize_phone(value: str | None) -> str | None:
+    text = _clean_nullable_text(value)
+    if not text:
+        return None
+    # Keep only characters commonly used in phone formatting.
+    normalized = re.sub(r"[^0-9+\-\s().]", "", text).strip()
+    # Require at least 8 digits to avoid noisy captures.
+    digit_count = len(re.sub(r"\D", "", normalized))
+    if digit_count < 8:
+        return None
+    return normalized
+
+
+def _fetch_overview_enrichment(ticker: str) -> tuple[str, str | None, str | None, str | None, str]:
     """Fallback enrichment theo từng mã qua Company.overview()."""
     try:
         df = Company(symbol=ticker).overview()
         if df is None or getattr(df, "empty", True):
-            return ticker, None, None, ""
+            return ticker, None, None, None, ""
         row = df.iloc[0].to_dict()
         industry = _extract_first_non_empty(
             row,
@@ -177,9 +190,24 @@ def _fetch_overview_enrichment(ticker: str) -> tuple[str, str | None, str | None
                 "exchange_name",
             ),
         )
-        return ticker, industry, exchange, ""
+        phone = _normalize_phone(
+            _extract_first_non_empty(
+                row,
+                (
+                    "phone",
+                    "telephone",
+                    "tel",
+                    "hotline",
+                    "company_phone",
+                    "companyPhone",
+                    "contact_phone",
+                    "contactPhone",
+                ),
+            )
+        )
+        return ticker, industry, exchange, phone, ""
     except Exception as exc:
-        return ticker, None, None, str(exc)
+        return ticker, None, None, None, str(exc)
 
 
 def _is_missing_industry(value) -> bool:
@@ -204,16 +232,16 @@ def _extract_wait_seconds(error_text: str, default_wait: int = 30) -> int:
     return default_wait
 
 
-def _fetch_overview_with_retry(ticker: str, max_attempts: int = 2) -> tuple[str, str | None, str | None]:
+def _fetch_overview_with_retry(ticker: str, max_attempts: int = 2) -> tuple[str, str | None, str | None, str | None]:
     """Gọi Company.overview() có xử lý rate limit mềm."""
     for attempt in range(1, max_attempts + 1):
-        t, industry, exchange, error_text = _fetch_overview_enrichment(ticker)
-        if industry or exchange:
-            return t, industry, exchange
+        t, industry, exchange, phone, error_text = _fetch_overview_enrichment(ticker)
+        if industry or exchange or phone:
+            return t, industry, exchange, phone
         if attempt < max_attempts:
             wait_s = _extract_wait_seconds(error_text, default_wait=30)
             time.sleep(wait_s)
-    return ticker, None, None
+    return ticker, None, None, None
 
 
 def enrich_tickers_with_company_info():
@@ -268,6 +296,7 @@ def enrich_tickers_with_company_info():
 
     records_to_upsert = []
     missing_industry_tickers = []
+    missing_phone_tickers = []
     for _, row in df.iterrows():
         ticker = row.get("ticker")
         if not ticker:
@@ -288,8 +317,28 @@ def enrich_tickers_with_company_info():
             or "UNKNOWN"
         )
         company_name_value = _clean_nullable_text(row.get("organName")) or _clean_nullable_text(existing.get("company_name"))
+        contact_phone_value = (
+            _normalize_phone(
+                _extract_first_non_empty(
+                    row.to_dict() if hasattr(row, "to_dict") else {},
+                    (
+                        "phone",
+                        "telephone",
+                        "tel",
+                        "hotline",
+                        "company_phone",
+                        "companyPhone",
+                        "contact_phone",
+                        "contactPhone",
+                    ),
+                )
+            )
+            or _normalize_phone(existing.get("contact_phone"))
+        )
         if _is_missing_industry(industry_value):
             missing_industry_tickers.append(clean_ticker)
+        if not contact_phone_value:
+            missing_phone_tickers.append(clean_ticker)
 
         records_to_upsert.append(
             {
@@ -297,45 +346,47 @@ def enrich_tickers_with_company_info():
                 "company_name": company_name_value,
                 "industry": industry_value,
                 "exchange": exchange_value,
+                "contact_phone": contact_phone_value,
             }
         )
 
-    # Fallback layer: enrich industry/exchange bằng Company.overview() cho các mã còn thiếu ngành.
-    # Guest tier bị giới hạn 20 req/phút, nên phải throttle và giới hạn số mã mỗi lần chạy.
-    if missing_industry_tickers:
-        max_fallback_tickers = int(os.getenv("ENRICH_OVERVIEW_MAX_TICKERS", "20"))
+    # Fallback layer: enrich industry/exchange/phone bằng Company.overview().
+    # Cho phép chạy full tự động theo nhu cầu (có throttle để tránh rate limit).
+    fallback_candidates = sorted(set(missing_industry_tickers + missing_phone_tickers))
+    if fallback_candidates:
+        max_fallback_tickers = int(os.getenv("ENRICH_OVERVIEW_MAX_TICKERS", "3000"))
         max_requests_per_minute = int(os.getenv("ENRICH_OVERVIEW_MAX_RPM", "18"))
         delay_s = max(60.0 / max_requests_per_minute, 0.0)
-        fallback_targets = missing_industry_tickers[:max_fallback_tickers]
+        fallback_targets = fallback_candidates[:max_fallback_tickers]
 
         print(
-            f"[ENRICH] Fallback Company.overview() cho {len(fallback_targets)}/{len(missing_industry_tickers)} "
-            "ma thieu nganh..."
+            f"[ENRICH] Fallback Company.overview() cho {len(fallback_targets)}/{len(fallback_candidates)} "
+            "ma thieu nganh/so dien thoai..."
         )
-        if len(missing_industry_tickers) > max_fallback_tickers:
+        if len(fallback_candidates) > max_fallback_tickers:
             print(
-                f"[ENRICH] Con {len(missing_industry_tickers) - max_fallback_tickers} ma chua enrich o luot nay "
+                f"[ENRICH] Con {len(fallback_candidates) - max_fallback_tickers} ma chua enrich o luot nay "
                 f"(gioi han ENRICH_OVERVIEW_MAX_TICKERS={max_fallback_tickers})."
             )
 
         fallback_map = {}
         for idx, ticker in enumerate(fallback_targets, start=1):
-            t, industry, exchange = _fetch_overview_with_retry(ticker, max_attempts=2)
-            fallback_map[t] = {"industry": industry, "exchange": exchange}
+            t, industry, exchange, phone = _fetch_overview_with_retry(ticker, max_attempts=2)
+            fallback_map[t] = {"industry": industry, "exchange": exchange, "contact_phone": phone}
             if idx < len(fallback_targets) and delay_s > 0:
                 time.sleep(delay_s)
 
         for rec in records_to_upsert:
             ticker = rec["ticker"]
-            if rec.get("industry"):
-                continue
             fb = fallback_map.get(ticker)
             if not fb:
                 continue
-            if fb.get("industry"):
+            if _is_missing_industry(rec.get("industry")) and fb.get("industry"):
                 rec["industry"] = fb["industry"]
-            if fb.get("exchange"):
+            if _clean_nullable_text(rec.get("exchange")) in {None, "UNKNOWN"} and fb.get("exchange"):
                 rec["exchange"] = fb["exchange"]
+            if not _normalize_phone(rec.get("contact_phone")) and fb.get("contact_phone"):
+                rec["contact_phone"] = _normalize_phone(fb["contact_phone"])
 
     upserted_count = 0
     batch_size = 100
@@ -346,12 +397,14 @@ def enrich_tickers_with_company_info():
 
     print(f"[ENRICH] Hoan tat: {upserted_count} ma duoc cap nhat vao bang tickers.")
     missing_after = sum(1 for r in records_to_upsert if _is_missing_industry(r.get("industry")))
+    missing_phone_after = sum(1 for r in records_to_upsert if not _normalize_phone(r.get("contact_phone")))
     return {
         "step": "enrich_company_info",
         "success": True,
         "records_fetched": len(records_to_upsert),
         "records_upserted": upserted_count,
         "industry_missing_after": missing_after,
+        "contact_phone_missing_after": missing_phone_after,
         "errors": 0,
         "error_rate": 0.0,
     }

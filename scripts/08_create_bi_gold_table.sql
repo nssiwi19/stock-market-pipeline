@@ -358,29 +358,55 @@ begin
     min_ticker_gate,
     refreshed_at
   )
+  with latest_revenue_per_ticker as (
+    select
+      g.ticker,
+      g.industry_normalized,
+      g.revenue,
+      row_number() over (
+        partition by g.ticker
+        order by g.period_year desc nulls last, g.created_at desc
+      ) as rn
+    from public.financial_reports_bi_gold g
+    where g.report_type = 'yearly'
+      and g.revenue is not null
+      and g.revenue >= 0
+      and g.quality_score_revenue >= 75
+  ),
+  latest_profit_per_ticker as (
+    select
+      g.ticker,
+      g.industry_normalized,
+      g.profit_after_tax,
+      row_number() over (
+        partition by g.ticker
+        order by g.period_year desc nulls last, g.created_at desc
+      ) as rn
+    from public.financial_reports_bi_gold g
+    where g.report_type = 'yearly'
+      and g.profit_after_tax is not null
+      and g.quality_score_profit >= 75
+  )
   select
-    coalesce(nullif(trim(l.industry_normalized), ''), 'UNKNOWN') as industry_normalized,
+    coalesce(nullif(trim(r.industry_normalized), ''), 'UNKNOWN') as industry_normalized,
     'revenue'::text as metric,
     count(*)::int as ticker_count,
-    round(sum(l.revenue)::numeric, 2) as total_value_bn,
+    round(sum(r.revenue)::numeric, 2) as total_value_bn,
     (count(*) >= 5) as min_ticker_gate,
     now()
-  from public.financial_reports_bi_gold_latest_yearly l
-  where l.bi_ready_revenue = true
-    and l.revenue is not null
-    and l.revenue >= 0
+  from latest_revenue_per_ticker r
+  where r.rn = 1
   group by 1
   union all
   select
-    coalesce(nullif(trim(l.industry_normalized), ''), 'UNKNOWN') as industry_normalized,
+    coalesce(nullif(trim(p.industry_normalized), ''), 'UNKNOWN') as industry_normalized,
     'profit'::text as metric,
     count(*)::int as ticker_count,
-    round(sum(l.profit_after_tax)::numeric, 2) as total_value_bn,
-    (count(*) >= 5) as min_ticker_gate,
+    round(sum(p.profit_after_tax)::numeric, 2) as total_value_bn,
+    (count(*) >= 3) as min_ticker_gate,
     now()
-  from public.financial_reports_bi_gold_latest_yearly l
-  where l.bi_ready_profit = true
-    and l.profit_after_tax is not null
+  from latest_profit_per_ticker p
+  where p.rn = 1
   group by 1;
 end;
 $$;

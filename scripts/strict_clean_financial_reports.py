@@ -37,11 +37,25 @@ RATIO_COLUMNS = {
     "asset_turnover",
 }
 TRUSTED_SOURCES = {"cafef_requests", "vietstock_financeinfo", "cafef_cloudscraper"}
+MONEY_COLUMNS = [c for c in TARGET_COLUMNS if c not in RATIO_COLUMNS and c != "eps"]
 
 AMOUNT_MAX_ABS = 10_000_000.0
 EPS_MAX_ABS = 100_000.0
 RATIO_MAX_ABS = 100.0
 API_RETRY_ATTEMPTS = 5
+# Detect rows likely stored in "trieu dong" while DB expects "ty dong".
+# We use revenue/profit anchors (not assets) to avoid false positives on large banks.
+SCALE_ANCHOR_COLUMNS = [
+    "revenue",
+    "cogs",
+    "gross_profit",
+    "operating_profit",
+    "profit_before_tax",
+    "profit_after_tax",
+    "cash_flow_operating",
+]
+SCALE_TRIGGER_ABS = 800_000.0
+SCALE_DIVISOR = 1000.0
 
 
 def _execute_with_retry(action):
@@ -100,6 +114,31 @@ def _threshold(col: str) -> float:
     return AMOUNT_MAX_ABS
 
 
+def _normalize_row_scale_if_needed(rec: dict[str, Any], src_parts: set[str]) -> bool:
+    """
+    Normalize likely unit drift rows (mostly from vietstock_financeinfo).
+    Returns True if row was scaled.
+    """
+    if "vietstock_financeinfo" not in src_parts:
+        return False
+    anchors: list[float] = []
+    for col in SCALE_ANCHOR_COLUMNS:
+        v = _to_num(rec.get(col))
+        if v is not None:
+            anchors.append(abs(v))
+    if not anchors:
+        return False
+    if max(anchors) <= SCALE_TRIGGER_ABS:
+        return False
+    for col in MONEY_COLUMNS:
+        v = _to_num(rec.get(col))
+        if v is None:
+            rec[col] = None
+            continue
+        rec[col] = v / SCALE_DIVISOR
+    return True
+
+
 def _recompute_ratios(rec: dict[str, Any]) -> None:
     revenue = _to_num(rec.get("revenue"))
     gross_profit = _to_num(rec.get("gross_profit"))
@@ -138,6 +177,7 @@ def main() -> None:
     stat = {
         "rows_scanned": len(rows),
         "rows_deleted_ocr_or_untrusted": 0,
+        "rows_scaled_unit_fix": 0,
         "cells_nullified_outlier_or_invalid": 0,
         "rows_recomputed_ratios": 0,
         "rows_updated": 0,
@@ -200,6 +240,11 @@ def main() -> None:
                 changed = True
                 continue
             update_rec[col] = num
+
+        # 1.5) scale normalization for likely unit drift rows
+        if _normalize_row_scale_if_needed(update_rec, src_parts):
+            stat["rows_scaled_unit_fix"] += 1
+            changed = True
 
         # 2) recompute ratio columns from cleaned base metrics
         before_ratios = {c: update_rec.get(c) for c in RATIO_COLUMNS}

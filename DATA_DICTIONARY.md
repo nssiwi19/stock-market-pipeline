@@ -19,6 +19,7 @@ Tai lieu nay mo ta y nghia va don vi cac truong chinh trong Supabase cho du an `
 | `exchange` | `VARCHAR(10)` | - | San giao dich (`HOSE`, `HNX`, `UPCOM`, `UNKNOWN`) |
 | `industry` | `VARCHAR(255)` | - | Nhom nganh chuan dung cho BI |
 | `company_name` | `TEXT` | - | Ten doanh nghiep |
+| `contact_phone` | `VARCHAR(50)` | - | So dien thoai lien he doanh nghiep (neu co) |
 | `created_at` | `TIMESTAMPTZ` | UTC | Thoi diem tao record |
 | `industry_inferred` | `TEXT` | - | Nganh suy luan (migration 02) |
 | `industry_inferred_confidence` | `NUMERIC(6,4)` | 0-1 | Do tin cay suy luan |
