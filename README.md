@@ -1,15 +1,24 @@
 
 # Vietnam Stock Market Pipeline
 
-Pipeline ETL cho du lieu chung khoan Viet Nam, luu tren Supabase Postgres va phuc vu dashboard BI.
+Pipeline ETL cho du lieu chung khoan Viet Nam, luu tren Supabase PostgreSQL va phuc vu dashboard BI.
 
 ## Muc tieu hien tai
 
 - Thu thap va cap nhat du lieu `daily_prices`, `tickers`, `financial_reports`.
 - Lam sach du lieu tai chinh theo trusted source (khong OCR cho BI).
-- Cung cap 1 lop du lieu "gold" on dinh de ve BI nganh doanh thu/loi nhuan.
+- Cung cap lop du lieu "gold" on dinh de ve BI nganh doanh thu/loi nhuan.
 
 ## Kien truc tong quan
+
+```mermaid
+graph TD
+    A[Data Sources: CafeF, Vietstock, vnstock] --> B[ETL Python Jobs]
+    B --> C[Supabase PostgreSQL Raw Tables]
+    C --> D[scripts/08_create_bi_gold_table.sql]
+    D --> E[financial_reports_bi_gold]
+    E --> F[Looker Studio Dashboard]
+```
 
 - Nguon du lieu: CafeF, Vietstock (structured), cac script ETL Python.
 - Kho du lieu: Supabase PostgreSQL.
@@ -29,13 +38,13 @@ Pipeline ETL cho du lieu chung khoan Viet Nam, luu tren Supabase Postgres va phu
 ## Cach dung lop BI Gold
 
 1. Chay file `scripts/08_create_bi_gold_table.sql` trong Supabase SQL Editor.
-1. Refresh bang vang:
+2. Refresh bang vang:
 
 ```sql
 select public.refresh_financial_reports_bi_gold();
 ```
 
-1. Ve dashboard tu bang aggregate:
+3. Ve dashboard tu bang aggregate:
 
 ```sql
 select industry_normalized, ticker_count, total_value_bn
@@ -50,6 +59,12 @@ from public.financial_reports_bi_gold_industry_agg
 where metric = 'profit' and min_ticker_gate = true
 order by total_value_bn desc;
 ```
+
+## Thu muc training
+
+- `training/` chi dung cho demo noi bo va tai lieu workshop.
+- Khong phai thanh phan runtime cua production pipeline.
+- Khong import truc tiep vao `run_pipeline.py`.
 
 ## Telegram Q&A Bot
 
@@ -72,3 +87,4 @@ Yeu cau:
 - BI nen doc tu bang gold (`financial_reports_bi_gold_*`) thay vi bang raw.
 - Khong thay `NULL` bang `0` voi metric tai chinh.
 - Ratio (`margin`, `roe`, `roa`) luu dang so thap phan, nhan `100` neu hien thi `%`.
+- Quy trinh lam viec nhom: xem `CONTRIBUTING.md`.

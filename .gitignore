@@ -20,3 +20,11 @@ etl/dead_letter/
 tmp_*
 scripts/output/
 logs/
+
+# Root-level accidental artifacts (do not commit)
+/debug_api.py
+/git
+/main
+/python
+/1000
+/1e6

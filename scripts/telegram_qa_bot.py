@@ -113,9 +113,60 @@ def _handle_text(chat_id: int, text: str) -> None:
     if cmd == "/whoami":
         _send_message(chat_id, f"chat_id={chat_id}")
         return
+
+    if cmd == "/report":
+        _send_message(chat_id, "Đang tổng hợp báo cáo thị trường, vui lòng đợi...")
+        try:
+            from etl import config
+            from etl import notifier
+            from etl.ai_agent import get_ai_market_summary
+            import pandas as pd
+            from datetime import timedelta
+            
+            client = config.get_supabase_client()
+            vn_tz = timezone(timedelta(hours=7))
+            today_str = datetime.now(vn_tz).strftime('%Y-%m-%d')
+            
+            latest_date_resp = client.table('daily_prices').select('trading_date').order('trading_date', desc=True).limit(1).execute()
+            
+            if latest_date_resp.data and len(latest_date_resp.data) > 0:
+                latest_date = latest_date_resp.data[0]['trading_date']
+                
+                response = client.table('daily_prices')\
+                    .select('ticker, close_price, volume')\
+                    .eq('trading_date', latest_date)\
+                    .order('volume', desc=True)\
+                    .limit(5).execute()
+
+                if response.data and len(response.data) > 0:
+                    df_top = pd.DataFrame(response.data)
+                    ai_insight = get_ai_market_summary(df_top)
+                    
+                    date_obj = datetime.strptime(latest_date, '%Y-%m-%d')
+                    date_formatted = date_obj.strftime('%d/%m/%Y')
+                    
+                    msg = f"✅ *BÁO CÁO THỊ TRƯỜNG {date_formatted}*\n"
+                    if latest_date != today_str:
+                        msg += f"_(Biểu đồ hiển thị dữ liệu của phiên gần nhất)_\n"
+                    msg += f"\n{ai_insight}\n"
+                    
+                    # Gửi biểu đồ thông qua notifier, tạm đổi CHAT_ID để đảm bảo đúng luồng gửi cho người yêu cầu
+                    original_chat_id = notifier.CHAT_ID
+                    notifier.CHAT_ID = str(chat_id)
+                    notifier.send_telegram_report_with_chart(df_top, msg)
+                    notifier.CHAT_ID = original_chat_id
+                else:
+                    _send_message(chat_id, "Không có dữ liệu giá nào trong ngày gần nhất.")
+            else:
+                _send_message(chat_id, "Database chưa có bất kỳ dữ liệu nào.")
+        except Exception as e:
+            _send_message(chat_id, f"Lỗi khi tạo báo cáo: {e}")
+        return
+
     if cmd in ("/start", "/help"):
         help_text = (
             "Xin chào. Đây là bot Q&A dữ liệu chứng khoán.\n"
+            "- Gõ /report để nhận báo cáo tổng quan thị trường mới nhất.\n"
             "- Đặt câu hỏi tự nhiên, ví dụ: Volume của mã nào lớn nhất ngày 2026-04-10?\n"
             "- Bot trả lời dựa trên dữ liệu Supabase (Text-to-SQL).\n"
             "- Bot không đưa khuyến nghị mua/bán trực tiếp.\n"

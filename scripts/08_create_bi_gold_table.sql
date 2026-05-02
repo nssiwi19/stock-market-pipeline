@@ -31,6 +31,7 @@ create table if not exists public.financial_reports_bi_gold (
   roe numeric,
   roa numeric,
   debt_to_equity numeric,
+  current_ratio numeric,
   asset_turnover numeric,
 
   quality_score int not null default 0,
@@ -51,6 +52,7 @@ alter table public.financial_reports_bi_gold add column if not exists bi_ready_r
 alter table public.financial_reports_bi_gold add column if not exists bi_ready_profit boolean not null default false;
 alter table public.financial_reports_bi_gold add column if not exists quality_score_revenue int not null default 0;
 alter table public.financial_reports_bi_gold add column if not exists quality_score_profit int not null default 0;
+alter table public.financial_reports_bi_gold add column if not exists current_ratio numeric;
 
 create index if not exists idx_financial_reports_bi_gold_industry on public.financial_reports_bi_gold(industry);
 create index if not exists idx_financial_reports_bi_gold_industry_norm on public.financial_reports_bi_gold(industry_normalized);
@@ -127,6 +129,7 @@ begin
     roe,
     roa,
     debt_to_equity,
+    current_ratio,
     asset_turnover,
     quality_score,
     quality_score_revenue,
@@ -175,7 +178,10 @@ begin
       case when abs(fr.eps) <= 100000 then fr.eps else null end as eps,
       case when abs(fr.total_assets) <= 10000000 then fr.total_assets else null end as total_assets,
       case when abs(fr.total_liabilities) <= 10000000 then fr.total_liabilities else null end as total_liabilities,
-      case when abs(fr.equity) <= 10000000 then fr.equity else null end as equity
+      case when abs(fr.equity) <= 10000000 then fr.equity else null end as equity,
+      case when abs(fr.total_current_assets) <= 10000000 then fr.total_current_assets else null end as total_current_assets,
+      case when abs(fr.total_short_term_liabilities) <= 10000000 then fr.total_short_term_liabilities else null end as total_short_term_liabilities,
+      case when abs(fr.current_ratio) <= 100 then fr.current_ratio else null end as current_ratio
     from public.financial_reports fr
     left join public.tickers t on t.ticker = fr.ticker
     where not (coalesce(fr.source, '') like '%vietstock_bctc_documents%')
@@ -201,7 +207,13 @@ begin
       case when b.equity is not null and b.equity <> 0 and b.total_liabilities is not null
         then b.total_liabilities / b.equity else null end as debt_to_equity_raw,
       case when b.total_assets is not null and b.total_assets <> 0 and b.revenue is not null
-        then b.revenue / b.total_assets else null end as asset_turnover_raw
+        then b.revenue / b.total_assets else null end as asset_turnover_raw,
+      case
+        when b.current_ratio is not null then b.current_ratio
+        when b.total_current_assets is not null and b.total_short_term_liabilities is not null and b.total_short_term_liabilities <> 0
+          then b.total_current_assets / b.total_short_term_liabilities
+        else null
+      end as current_ratio_raw
     from base b
   ),
   normalized as (
@@ -232,6 +244,7 @@ begin
       case when r.roe_raw is not null and abs(r.roe_raw) <= 100 then r.roe_raw else null end as roe,
       case when r.roa_raw is not null and abs(r.roa_raw) <= 100 then r.roa_raw else null end as roa,
       case when r.debt_to_equity_raw is not null and abs(r.debt_to_equity_raw) <= 100 then r.debt_to_equity_raw else null end as debt_to_equity,
+      case when r.current_ratio_raw is not null and abs(r.current_ratio_raw) <= 100 then r.current_ratio_raw else null end as current_ratio,
       case when r.asset_turnover_raw is not null and abs(r.asset_turnover_raw) <= 100 then r.asset_turnover_raw else null end as asset_turnover,
       (
         case when r.revenue is not null then 35 else 0 end +
@@ -291,6 +304,7 @@ begin
     n.roe,
     n.roa,
     n.debt_to_equity,
+    n.current_ratio,
     n.asset_turnover,
     n.quality_score,
     n.quality_score_revenue,

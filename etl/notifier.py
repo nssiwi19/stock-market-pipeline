@@ -81,13 +81,22 @@ def send_telegram_report_with_chart(df, message):
         # 4. Gửi ảnh qua Telegram (sendPhoto)
         url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
         files = {'photo': ('chart.png', buf, 'image/png')}
-        data = {
-            'chat_id': CHAT_ID, 
-            'caption': message, 
-            'parse_mode': 'Markdown'
-        }
         
-        response = requests.post(url, data=data, files=files, timeout=20)
+        if len(message) <= 1000:
+            data = {
+                'chat_id': CHAT_ID, 
+                'caption': message, 
+                'parse_mode': 'Markdown'
+            }
+            response = requests.post(url, data=data, files=files, timeout=20)
+        else:
+            send_telegram_msg(message)
+            data = {
+                'chat_id': CHAT_ID, 
+                'caption': "📊 Biểu đồ đính kèm", 
+                'parse_mode': 'Markdown'
+            }
+            response = requests.post(url, data=data, files=files, timeout=20)
         
         if response.status_code == 200:
             print("🖼️ Đã gửi biểu đồ qua Telegram thành công!")
