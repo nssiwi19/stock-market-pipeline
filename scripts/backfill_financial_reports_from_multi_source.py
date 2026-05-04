@@ -37,6 +37,14 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from psycopg2 import OperationalError
 from psycopg2 import sql
+DISABLE_VNSTOCK_IMPORT = str(os.getenv("DISABLE_VNSTOCK_IMPORT", "")).strip().lower() in {"1", "true", "yes", "on"}
+if not DISABLE_VNSTOCK_IMPORT:
+    try:
+        from vnstock.api.financial import Finance as VNFinance  # type: ignore
+    except Exception:  # pragma: no cover
+        VNFinance = None
+else:  # pragma: no cover
+    VNFinance = None
 try:
     import pdfplumber  # type: ignore
 except Exception:  # pragma: no cover
@@ -116,21 +124,58 @@ TARGET_COLUMNS = [
     "asset_turnover",
 ]
 
-SOURCE_PRIORITY = ["cafef_requests", "vietstock_financeinfo", "vietstock_bctc_documents", "cafef_cloudscraper"]
+BI_PRIORITY_GROUPS: dict[str, list[str]] = {
+    "stage_1_core": [
+        "revenue",
+        "profit_after_tax",
+    ],
+    "stage_2_financial_base": [
+        "gross_profit",
+        "operating_profit",
+        "total_assets",
+        "equity",
+        "total_liabilities",
+    ],
+    "stage_3_ratio": [
+        "gross_margin",
+        "operating_margin",
+        "net_margin",
+        "roe",
+        "roa",
+        "debt_to_equity",
+        "current_ratio",
+        "asset_turnover",
+    ],
+}
+
+SOURCE_PRIORITY = [
+    "cafef_requests",
+    "vietstock_financeinfo",
+    "vci_financial_api",
+    "vietstock_bctc_documents",
+    "cafef_cloudscraper",
+]
 SOURCE_CONFIDENCE = {
     "cafef_requests": 0.90,
     "vietstock_financeinfo": 0.88,
+    "vci_financial_api": 0.86,
     "vietstock_bctc_documents": 0.80,
     "cafef_cloudscraper": 0.82,
 }
-TRUSTED_SOURCES = {"cafef_requests", "vietstock_financeinfo", "cafef_cloudscraper"}
+TRUSTED_SOURCES = {"cafef_requests", "vietstock_financeinfo", "vci_financial_api", "cafef_cloudscraper"}
 EPS_MAX_ABS = 100_000.0
-EPS_TRUSTED_SOURCES = {"cafef_requests", "vietstock_financeinfo", "cafef_cloudscraper"}
+EPS_TRUSTED_SOURCES = {"cafef_requests", "vietstock_financeinfo", "vci_financial_api", "cafef_cloudscraper"}
 VIETSTOCK_TOKEN_URL = "https://finance.vietstock.vn/chi-so-nganh.htm"
 VIETSTOCK_FINANCEINFO_URL = "https://finance.vietstock.vn/data/financeinfo"
 VIETSTOCK_BCTC_DOC_PAGE_URL = "https://finance.vietstock.vn/tai-lieu/bao-cao-tai-chinh.htm"
 VIETSTOCK_GET_RPT_TERM_URL = "https://finance.vietstock.vn/data/getrptterm"
 VIETSTOCK_GET_RPT_FILE_URL = "https://finance.vietstock.vn/data/getrptfile"
+VIETSTOCK_HTTP_RETRY_ATTEMPTS = 4
+VIETSTOCK_HTTP_BASE_BACKOFF_S = 2.0
+CAFEF_HTTP_RETRY_ATTEMPTS = 4
+CAFEF_HTTP_BASE_BACKOFF_S = 2.0
+UPSERT_RETRY_ATTEMPTS = 6
+UPSERT_BASE_BACKOFF_S = 2.0
 VIETSTOCK_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -161,6 +206,7 @@ OCR_DEBUG_ENABLED = False
 OCR_DEBUG_TICKERS: set[str] = set()
 OCR_DEBUG_MAX_LINES = 120
 OCR_DEBUG_MAX_FILES_PER_TICKER = 2
+OCR_SOURCE_TICKERS: set[str] = set()
 OCR_CHAR_MAP = str.maketrans(
     {
         "0": "o",
@@ -206,6 +252,64 @@ def _connect_with_retry(db_uri: str, attempts: int = 4, base_sleep_s: float = 1.
     raise RuntimeError("Failed to connect to database")
 
 
+def _request_with_retry(
+    method: str,
+    session: requests.Session,
+    url: str,
+    *,
+    attempts: int = VIETSTOCK_HTTP_RETRY_ATTEMPTS,
+    base_backoff_s: float = VIETSTOCK_HTTP_BASE_BACKOFF_S,
+    retry_on_statuses: set[int] | None = None,
+    **kwargs,
+) -> requests.Response:
+    retry_statuses = retry_on_statuses or {429, 500, 502, 503, 504}
+    last_exc: Exception | None = None
+    for i in range(1, max(attempts, 1) + 1):
+        try:
+            resp = session.request(method=method.upper(), url=url, **kwargs)
+            if resp.status_code in retry_statuses and i < attempts:
+                time.sleep(base_backoff_s * (2 ** (i - 1)))
+                continue
+            resp.raise_for_status()
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if i >= attempts:
+                raise
+            time.sleep(base_backoff_s * (2 ** (i - 1)))
+        except requests.exceptions.HTTPError as exc:
+            last_exc = exc
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code in retry_statuses and i < attempts:
+                time.sleep(base_backoff_s * (2 ** (i - 1)))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Failed request after retries: {method} {url}")
+
+
+def _cafef_fetch_with_retry(scraper, url: str, timeout: int = 20) -> str:
+    last_exc: Exception | None = None
+    for i in range(1, CAFEF_HTTP_RETRY_ATTEMPTS + 1):
+        try:
+            response = scraper.get(url, headers=ef.HEADERS, timeout=timeout)
+            if response.status_code == 200:
+                return response.text
+            if response.status_code in {429, 500, 502, 503, 504} and i < CAFEF_HTTP_RETRY_ATTEMPTS:
+                time.sleep(CAFEF_HTTP_BASE_BACKOFF_S * (2 ** (i - 1)))
+                continue
+            return ""
+        except Exception as exc:
+            last_exc = exc
+            if i >= CAFEF_HTTP_RETRY_ATTEMPTS:
+                raise
+            time.sleep(CAFEF_HTTP_BASE_BACKOFF_S * (2 ** (i - 1)))
+    if last_exc:
+        raise last_exc
+    return ""
+
+
 def _ensure_metadata_columns(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -218,19 +322,31 @@ def _ensure_metadata_columns(conn) -> None:
     conn.commit()
 
 
-def _pick_pilot_tickers(cur, limit: int, mode: str, min_null_rate: float) -> list[str]:
+def _pick_pilot_tickers(
+    cur,
+    limit: int,
+    mode: str,
+    min_null_rate: float,
+    exclude_tickers: list[str] | None = None,
+) -> list[str]:
     cols = FOCUS_COLUMNS if mode == "targeted" else TARGET_COLUMNS
     col_expr = " + ".join([f"CASE WHEN {c} IS NULL THEN 1 ELSE 0 END" for c in cols])
     denominator = len(cols)
+    excluded = [str(t).strip().upper() for t in (exclude_tickers or []) if str(t).strip()]
+    where_clause = "WHERE ticker <> ALL(%s)" if excluded else ""
     query = f"""
         SELECT ticker
         FROM financial_reports
+        {where_clause}
         GROUP BY ticker
         HAVING (SUM({col_expr})::float / NULLIF(COUNT(*) * {denominator}, 0)) >= %s
         ORDER BY (SUM({col_expr})::float / NULLIF(COUNT(*) * {denominator}, 0)) DESC, ticker
         LIMIT %s
     """
-    cur.execute(query, (min_null_rate, limit))
+    if excluded:
+        cur.execute(query, (excluded, min_null_rate, limit))
+    else:
+        cur.execute(query, (min_null_rate, limit))
     rows = [r[0] for r in cur.fetchall() if r and r[0]]
     if rows:
         return rows
@@ -239,11 +355,15 @@ def _pick_pilot_tickers(cur, limit: int, mode: str, min_null_rate: float) -> lis
     query_no_threshold = f"""
         SELECT ticker
         FROM financial_reports
+        {where_clause}
         GROUP BY ticker
         ORDER BY (SUM({col_expr})::float / NULLIF(COUNT(*) * {denominator}, 0)) DESC, ticker
         LIMIT %s
     """
-    cur.execute(query_no_threshold, (limit,))
+    if excluded:
+        cur.execute(query_no_threshold, (excluded, limit))
+    else:
+        cur.execute(query_no_threshold, (limit,))
     return [r[0] for r in cur.fetchall() if r and r[0]]
 
 
@@ -271,6 +391,40 @@ def _compute_record_gain(existing: dict[str, Any] | None, incoming: dict[str, An
         if existing.get(col) is None and incoming.get(col) is not None:
             gain += 1
     return gain
+
+
+def _safe_fill_rate_pct(total_null: int, total_cells: int) -> float:
+    if total_cells <= 0:
+        return 0.0
+    return round((1.0 - (float(total_null) / float(total_cells))) * 100.0, 2)
+
+
+def _pick_top_missing_tickers(
+    existing_map: dict[tuple[str, str, str], dict[str, Any]],
+    tickers: list[str],
+    *,
+    columns: list[str],
+    top_n: int,
+) -> set[str]:
+    if top_n <= 0 or not tickers or not columns:
+        return set()
+    missing_stats: list[tuple[float, str]] = []
+    for ticker in tickers:
+        rows = [rec for key, rec in existing_map.items() if key[0] == ticker]
+        if not rows:
+            missing_stats.append((1.0, ticker))
+            continue
+        null_count = 0
+        total_cells = 0
+        for rec in rows:
+            for col in columns:
+                total_cells += 1
+                if rec.get(col) is None:
+                    null_count += 1
+        miss_rate = (float(null_count) / float(total_cells)) if total_cells > 0 else 1.0
+        missing_stats.append((miss_rate, ticker))
+    missing_stats.sort(key=lambda x: (-x[0], x[1]))
+    return {ticker for _, ticker in missing_stats[:top_n]}
 
 
 def _count_non_null_target_fields(rec: dict[str, Any]) -> int:
@@ -350,12 +504,12 @@ def _calc_profile(
                 null_by_col[col] += 1
     total_cells = total_rows * len(TARGET_COLUMNS)
     total_null = sum(null_by_col.values())
-    fill_rate = (1.0 - total_null / total_cells) * 100.0 if total_cells else 0.0
+    fill_rate = _safe_fill_rate_pct(total_null, total_cells)
     return {
         "rows": total_rows,
         "columns": len(TARGET_COLUMNS),
         "null_by_column": null_by_col,
-        "fill_rate_pct": round(fill_rate, 2),
+        "fill_rate_pct": fill_rate,
     }
 
 
@@ -397,10 +551,10 @@ def _build_record_from_rows(ticker: str, rows_inc, rows_bs, rows_cf) -> list[dic
 
 
 def _fetch_rows_cloudscraper(scraper, url: str):
-    response = scraper.get(url, headers=ef.HEADERS, timeout=20)
-    if response.status_code != 200:
+    html = _cafef_fetch_with_retry(scraper, url, timeout=20)
+    if not html:
         return []
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     table = ef._find_financial_table(soup)
     if not table:
         return []
@@ -526,8 +680,13 @@ def _value_key_for_period(
 
 def fetch_from_vietstock_financeinfo(ticker: str) -> list[dict[str, Any]]:
     session = requests.Session()
-    token_resp = session.get(VIETSTOCK_TOKEN_URL, headers=VIETSTOCK_HEADERS, timeout=25)
-    token_resp.raise_for_status()
+    token_resp = _request_with_retry(
+        "GET",
+        session,
+        VIETSTOCK_TOKEN_URL,
+        headers=VIETSTOCK_HEADERS,
+        timeout=25,
+    )
     soup = BeautifulSoup(token_resp.text, "html.parser")
     token_node = soup.select_one('input[name="__RequestVerificationToken"]')
     if not token_node or not token_node.get("value"):
@@ -545,8 +704,14 @@ def fetch_from_vietstock_financeinfo(ticker: str) -> list[dict[str, Any]]:
     }
     headers = dict(VIETSTOCK_HEADERS)
     headers["Referer"] = VIETSTOCK_TOKEN_URL
-    r = session.post(VIETSTOCK_FINANCEINFO_URL, data=payload, headers=headers, timeout=25)
-    r.raise_for_status()
+    r = _request_with_retry(
+        "POST",
+        session,
+        VIETSTOCK_FINANCEINFO_URL,
+        data=payload,
+        headers=headers,
+        timeout=25,
+    )
     data = r.json()
     if not isinstance(data, list) or len(data) < 2:
         return []
@@ -635,8 +800,13 @@ def fetch_vietstock_bctc_document_links(
     This source currently provides file metadata (pdf/zip/xls links), not normalized numeric rows.
     """
     session = requests.Session()
-    token_resp = session.get(VIETSTOCK_BCTC_DOC_PAGE_URL, headers=VIETSTOCK_HEADERS, timeout=25)
-    token_resp.raise_for_status()
+    token_resp = _request_with_retry(
+        "GET",
+        session,
+        VIETSTOCK_BCTC_DOC_PAGE_URL,
+        headers=VIETSTOCK_HEADERS,
+        timeout=25,
+    )
     soup = BeautifulSoup(token_resp.text, "html.parser")
     token_node = soup.select_one('input[name="__RequestVerificationToken"]')
     if not token_node or not token_node.get("value"):
@@ -645,15 +815,15 @@ def fetch_vietstock_bctc_document_links(
     headers = dict(VIETSTOCK_HEADERS)
     headers["Referer"] = VIETSTOCK_BCTC_DOC_PAGE_URL
 
-    terms = (
-        session.post(
-            VIETSTOCK_GET_RPT_TERM_URL,
-            data={"documentTypeID": 1, "top": int(max(top_terms, 1))},
-            headers=headers,
-            timeout=25,
-        ).json()
-        or []
+    terms_resp = _request_with_retry(
+        "POST",
+        session,
+        VIETSTOCK_GET_RPT_TERM_URL,
+        data={"documentTypeID": 1, "top": int(max(top_terms, 1))},
+        headers=headers,
+        timeout=25,
     )
+    terms = terms_resp.json() or []
     out: list[dict[str, Any]] = []
     for term in terms:
         payload = {
@@ -668,7 +838,15 @@ def fetch_vietstock_bctc_document_links(
             "pageSize": str(max(page_size, 1)),
             "__RequestVerificationToken": token,
         }
-        rows = session.post(VIETSTOCK_GET_RPT_FILE_URL, data=payload, headers=headers, timeout=25).json() or []
+        rows_resp = _request_with_retry(
+            "POST",
+            session,
+            VIETSTOCK_GET_RPT_FILE_URL,
+            data=payload,
+            headers=headers,
+            timeout=25,
+        )
+        rows = rows_resp.json() or []
         for row in rows:
             out.append(
                 {
@@ -688,9 +866,14 @@ def _inspect_zip_document(url: str, timeout: int = 25) -> dict[str, Any]:
     Inspect zip content quickly to detect if there are machine-readable files.
     """
     try:
-        resp = requests.get(url, headers={"User-Agent": VIETSTOCK_HEADERS["User-Agent"]}, timeout=timeout)
-        if resp.status_code != 200:
-            return {"zip_inspected": False, "zip_member_count": 0, "zip_has_excel": False, "zip_has_pdf": False}
+        session = requests.Session()
+        resp = _request_with_retry(
+            "GET",
+            session,
+            url,
+            headers={"User-Agent": VIETSTOCK_HEADERS["User-Agent"]},
+            timeout=timeout,
+        )
         zf = zipfile.ZipFile(io.BytesIO(resp.content))
         names = [n.lower() for n in zf.namelist()]
         has_excel = any(n.endswith((".xls", ".xlsx", ".xlsm", ".csv")) for n in names)
@@ -827,6 +1010,164 @@ def _find_metric_field(label_text: str) -> str | None:
                 if ratio >= 0.78:
                     return field
     return None
+
+
+RATIO_FIELDS = {
+    "gross_margin",
+    "operating_margin",
+    "net_margin",
+    "roe",
+    "roa",
+    "debt_to_equity",
+    "current_ratio",
+    "asset_turnover",
+}
+PERCENT_RATIO_FIELDS = {"gross_margin", "operating_margin", "net_margin", "roe", "roa"}
+NON_MONETARY_FIELDS = {"eps", *RATIO_FIELDS}
+VCI_COLUMN_FIELD_MAP: dict[str, str] = {
+    "revenue": "revenue",
+    "net_profit": "profit_after_tax",
+    "gross_profit": "gross_profit",
+    "operating_profit": "operating_profit",
+    "profit_before_tax": "profit_before_tax",
+    "total_assets": "total_assets",
+    "total_liabilities": "total_liabilities",
+    "owner_equity": "owner_equity",
+    "equity": "equity",
+    "current_ratio": "current_ratio",
+    "roe": "roe",
+    "roa": "roa",
+    "debt_to_equity": "debt_to_equity",
+    "asset_turnover": "asset_turnover",
+    "gross_margin": "gross_margin",
+    "operating_margin": "operating_margin",
+    "net_margin": "net_margin",
+    "eps": "eps",
+}
+
+
+def _extract_year(value: Any) -> int | None:
+    if value is None:
+        return None
+    m = re.search(r"(20\d{2})", str(value))
+    if not m:
+        return None
+    try:
+        year = int(m.group(1))
+    except ValueError:
+        return None
+    if 2000 <= year <= datetime.now().year + 1:
+        return year
+    return None
+
+
+def _vci_col_to_field(col_name: str) -> str | None:
+    norm = _norm_text(col_name).replace(" ", "_")
+    if norm in VCI_COLUMN_FIELD_MAP:
+        return VCI_COLUMN_FIELD_MAP[norm]
+    guessed = _find_metric_field(col_name)
+    return guessed
+
+
+def _records_from_vci_dataframe(ticker: str, df: pd.DataFrame) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    year_col = None
+    for c in df.columns:
+        if _norm_text(str(c)).replace(" ", "") in {"yearreport", "nam", "năm"}:
+            year_col = c
+            break
+    # Fallback: detect a year-like column from first rows.
+    if year_col is None:
+        for c in df.columns:
+            sample = [df[c].iloc[i] for i in range(min(4, len(df)))]
+            if any(_extract_year(v) is not None for v in sample):
+                year_col = c
+                break
+    scale_to_bn = _detect_scale_to_bn_from_df(df)
+    by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        year = _extract_year(row.get(year_col)) if year_col is not None else _extract_year(df.index[i])
+        if year is None:
+            continue
+        key = (ticker, "yearly", str(year))
+        rec = by_key.setdefault(key, {"ticker": ticker, "report_type": "yearly", "period": str(year)})
+        for c in df.columns:
+            if c == year_col:
+                continue
+            field = _vci_col_to_field(str(c))
+            if not field:
+                continue
+            raw = _parse_vn_number_loose(row.get(c))
+            if raw is None:
+                continue
+            value = raw
+            if field not in NON_MONETARY_FIELDS:
+                value = raw / scale_to_bn if scale_to_bn > 0 else raw
+            elif field in PERCENT_RATIO_FIELDS and abs(raw) > 1 and abs(raw) <= 100:
+                value = raw / 100.0
+            if rec.get(field) is None:
+                rec[field] = round(value, 6)
+
+    out: list[dict[str, Any]] = []
+    for rec in by_key.values():
+        rec["equity"] = rec.get("equity") or rec.get("owner_equity")
+        rec["ebit"] = rec.get("ebit") or ef._safe_add(rec.get("operating_profit"), rec.get("interest_expense"))
+        rec["ebitda"] = rec.get("ebitda") or ef._safe_add(rec.get("ebit"), rec.get("depreciation_amortization"))
+        rec["gross_margin"] = rec.get("gross_margin") or ef._safe_div(rec.get("gross_profit"), rec.get("revenue"))
+        rec["operating_margin"] = rec.get("operating_margin") or ef._safe_div(rec.get("operating_profit"), rec.get("revenue"))
+        rec["net_margin"] = rec.get("net_margin") or ef._safe_div(rec.get("profit_after_tax"), rec.get("revenue"))
+        rec["roe"] = rec.get("roe") or ef._safe_div(rec.get("profit_after_tax"), rec.get("owner_equity"))
+        rec["roa"] = rec.get("roa") or ef._safe_div(rec.get("profit_after_tax"), rec.get("total_assets"))
+        rec["debt_to_equity"] = rec.get("debt_to_equity") or ef._safe_div(rec.get("total_liabilities"), rec.get("owner_equity"))
+        rec["current_ratio"] = rec.get("current_ratio") or ef._safe_div(
+            rec.get("total_current_assets"), rec.get("total_short_term_liabilities")
+        )
+        rec["asset_turnover"] = rec.get("asset_turnover") or ef._safe_div(rec.get("revenue"), rec.get("total_assets"))
+        if any(rec.get(c) is not None for c in TARGET_COLUMNS):
+            out.append(rec)
+    return out
+
+
+def fetch_from_vci_financial_api(ticker: str) -> list[dict[str, Any]]:
+    if VNFinance is None:
+        return []
+    try:
+        api = VNFinance(source="vci", symbol=ticker, period="year", get_all=True, show_log=False)
+    except Exception:
+        return []
+
+    frames: list[pd.DataFrame] = []
+    for fn_name in ("income_statement", "balance_sheet", "cash_flow", "ratio"):
+        fn = getattr(api, fn_name, None)
+        if not callable(fn):
+            continue
+        try:
+            df = fn(period="year", lang="vi", dropna=False)
+        except TypeError:
+            try:
+                df = fn(period="year", lang="vi")
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            frames.append(df)
+
+    merged_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for df in frames:
+        for rec in _records_from_vci_dataframe(ticker, df):
+            key = (str(rec.get("ticker")), str(rec.get("report_type")), str(rec.get("period")))
+            base = merged_by_key.setdefault(
+                key,
+                {"ticker": rec.get("ticker"), "report_type": rec.get("report_type"), "period": rec.get("period")},
+            )
+            for col in TARGET_COLUMNS:
+                if base.get(col) is None and rec.get(col) is not None:
+                    base[col] = rec.get(col)
+    return list(merged_by_key.values())
 
 
 def _records_from_dataframe(ticker: str, df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -1168,15 +1509,14 @@ def _extract_records_from_doc_url(ticker: str, url: str, ext: str, timeout: int 
     if url.startswith("/"):
         url = f"https://finance.vietstock.vn{url}"
     try:
-        resp = requests.get(url, headers={"User-Agent": VIETSTOCK_HEADERS["User-Agent"]}, timeout=timeout)
-        if resp.status_code != 200:
-            _write_ocr_debug_event(
-                ticker=ticker,
-                source_tag="pdf_fetch",
-                url=url,
-                event={"status": "http_non_200", "http_status": resp.status_code, "ext": ext},
-            )
-            return []
+        session = requests.Session()
+        resp = _request_with_retry(
+            "GET",
+            session,
+            url,
+            headers={"User-Agent": VIETSTOCK_HEADERS["User-Agent"]},
+            timeout=timeout,
+        )
         content = resp.content
     except Exception:
         _write_ocr_debug_event(
@@ -1417,12 +1757,25 @@ def _merge_source_records(
 def _upsert_records(records: list[dict[str, Any]]) -> int:
     if not records:
         return 0
-    supabase = get_supabase_client()
     batch_size = 100
     done = 0
     for i in range(0, len(records), batch_size):
         batch = records[i : i + batch_size]
-        supabase.table("financial_reports").upsert(batch, on_conflict="ticker,report_type,period").execute()
+        last_exc: Exception | None = None
+        for attempt in range(1, UPSERT_RETRY_ATTEMPTS + 1):
+            try:
+                # Recreate client on each attempt to recover from stale/broken HTTP sessions.
+                supabase = get_supabase_client()
+                supabase.table("financial_reports").upsert(batch, on_conflict="ticker,report_type,period").execute()
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= UPSERT_RETRY_ATTEMPTS:
+                    raise
+                time.sleep(UPSERT_BASE_BACKOFF_S * (2 ** (attempt - 1)))
+        if last_exc is not None:
+            raise last_exc
         done += len(batch)
     return done
 
@@ -1440,6 +1793,7 @@ def _write_pilot_report(
     json_path = out_dir / "backfill_multisource_pilot_report.json"
     csv_path = out_dir / "backfill_multisource_pilot_column_delta.csv"
     doc_csv_path = out_dir / "backfill_multisource_pilot_document_inventory.csv"
+    bi_priority_csv_path = out_dir / "backfill_multisource_pilot_bi_priority_fill.csv"
 
     deltas = []
     for col in TARGET_COLUMNS:
@@ -1459,6 +1813,40 @@ def _write_pilot_report(
         writer = csv.DictWriter(f, fieldnames=["column_name", "null_before", "null_after", "filled_cells"])
         writer.writeheader()
         writer.writerows(deltas)
+
+    bi_priority_rows: list[dict[str, Any]] = []
+    for group_name, cols in BI_PRIORITY_GROUPS.items():
+        before_null = sum(before["null_by_column"].get(c, 0) for c in cols)
+        after_null = sum(after["null_by_column"].get(c, 0) for c in cols)
+        total_cells = max(before.get("rows", 0), 0) * len(cols)
+        before_fill = _safe_fill_rate_pct(before_null, total_cells)
+        after_fill = _safe_fill_rate_pct(after_null, total_cells)
+        bi_priority_rows.append(
+            {
+                "group_name": group_name,
+                "column_count": len(cols),
+                "rows": max(before.get("rows", 0), 0),
+                "fill_rate_before_pct": before_fill,
+                "fill_rate_after_pct": after_fill,
+                "fill_rate_gain_pct_point": round(after_fill - before_fill, 2),
+                "columns": ",".join(cols),
+            }
+        )
+    with bi_priority_csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "group_name",
+                "column_count",
+                "rows",
+                "fill_rate_before_pct",
+                "fill_rate_after_pct",
+                "fill_rate_gain_pct_point",
+                "columns",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(bi_priority_rows)
 
     if document_inventory:
         doc_fields = [
@@ -1488,12 +1876,19 @@ def _write_pilot_report(
         "before": before,
         "after": after,
         "fill_rate_gain_pct_point": round(after["fill_rate_pct"] - before["fill_rate_pct"], 2),
+        "bi_priority_fill": bi_priority_rows,
         "source_stats": source_stats,
         "column_delta_csv": str(csv_path),
+        "bi_priority_fill_csv": str(bi_priority_csv_path),
         "document_inventory_csv": str(doc_csv_path),
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"json": str(json_path), "csv": str(csv_path), "doc_csv": str(doc_csv_path)}
+    return {
+        "json": str(json_path),
+        "csv": str(csv_path),
+        "doc_csv": str(doc_csv_path),
+        "bi_priority_csv": str(bi_priority_csv_path),
+    }
 
 
 def run_pilot(
@@ -1514,12 +1909,18 @@ def run_pilot(
     ocr_debug_tickers: str = "",
     ocr_debug_max_lines: int = 120,
     ocr_debug_max_files_per_ticker: int = 2,
+    ocr_source_tickers: str = "",
+    ocr_source_top_missing: int = 0,
+    max_workers: int = 4,
+    exclude_tickers: str = "",
 ) -> dict[str, Any]:
-    global OCR_DEBUG_ENABLED, OCR_DEBUG_TICKERS, OCR_DEBUG_MAX_LINES, OCR_DEBUG_MAX_FILES_PER_TICKER
+    global OCR_DEBUG_ENABLED, OCR_DEBUG_TICKERS, OCR_DEBUG_MAX_LINES, OCR_DEBUG_MAX_FILES_PER_TICKER, OCR_SOURCE_TICKERS
     OCR_DEBUG_ENABLED = bool(ocr_debug)
     OCR_DEBUG_TICKERS = {t.strip().upper() for t in str(ocr_debug_tickers or "").split(",") if t.strip()}
     OCR_DEBUG_MAX_LINES = max(int(ocr_debug_max_lines or 0), 10)
     OCR_DEBUG_MAX_FILES_PER_TICKER = max(int(ocr_debug_max_files_per_ticker or 0), 1)
+    OCR_SOURCE_TICKERS = {t.strip().upper() for t in str(ocr_source_tickers or "").split(",") if t.strip()}
+    excluded_tickers_list = [t.strip().upper() for t in str(exclude_tickers or "").split(",") if t.strip()]
 
     load_dotenv()
     db_uri = _get_db_uri()
@@ -1528,8 +1929,21 @@ def run_pilot(
         with _connect_with_retry(db_uri, attempts=4, base_sleep_s=1.5) as conn:
             _ensure_metadata_columns(conn)
             with conn.cursor() as cur:
-                tickers = _pick_pilot_tickers(cur, limit=limit, mode=mode, min_null_rate=min_null_rate)
+                tickers = _pick_pilot_tickers(
+                    cur,
+                    limit=limit,
+                    mode=mode,
+                    min_null_rate=min_null_rate,
+                    exclude_tickers=excluded_tickers_list,
+                )
                 existing_map = _fetch_existing_records(cur, tickers)
+                if allow_ocr_source and int(ocr_source_top_missing or 0) > 0 and not OCR_SOURCE_TICKERS:
+                    OCR_SOURCE_TICKERS = _pick_top_missing_tickers(
+                        existing_map,
+                        tickers,
+                        columns=BI_PRIORITY_GROUPS["stage_1_core"] + BI_PRIORITY_GROUPS["stage_2_financial_base"],
+                        top_n=max(int(ocr_source_top_missing), 0),
+                    )
                 baseline_keys = set(existing_map.keys())
                 before = _calc_profile(cur, tickers, baseline_keys=baseline_keys)
     except OperationalError:
@@ -1546,6 +1960,7 @@ def run_pilot(
     source_stats = {
         "cafef_requests_records": 0,
         "vietstock_financeinfo_records": 0,
+        "vci_financial_api_records": 0,
         "vietstock_doc_files": 0,
         "vietstock_doc_pdf_files": 0,
         "vietstock_doc_zip_files": 0,
@@ -1568,28 +1983,37 @@ def run_pilot(
         "eps_cleaned_untrusted_source": 0,
         "eps_cleaned_other": 0,
         "ocr_source_disabled": 0,
+        "ocr_source_not_selected": 0,
     }
     all_records: list[dict[str, Any]] = []
     all_doc_files: list[dict[str, Any]] = []
     allowed_sources_set = {s.strip() for s in str(new_key_allowed_sources or "").split(",") if s.strip()}
     if not allowed_sources_set:
-        allowed_sources_set = {"vietstock_bctc_documents", "vietstock_financeinfo"}
+        allowed_sources_set = {"vietstock_bctc_documents", "vietstock_financeinfo", "vci_financial_api"}
 
     def _process_ticker(ticker: str):
         records_by_source: dict[str, list[dict[str, Any]]] = {}
         doc_files: list[dict[str, Any]] = []
         source_exc_count = 0
         rec1: list[dict[str, Any]] = []
-        try:
-            rec1 = ef.fetch_single_ticker_financials(ticker)
-        except Exception as exc:
+        cafef_last_exc: Exception | None = None
+        for i in range(1, CAFEF_HTTP_RETRY_ATTEMPTS + 1):
+            try:
+                rec1 = ef.fetch_single_ticker_financials(ticker)
+                cafef_last_exc = None
+                break
+            except Exception as exc:
+                cafef_last_exc = exc
+                if i < CAFEF_HTTP_RETRY_ATTEMPTS:
+                    time.sleep(CAFEF_HTTP_BASE_BACKOFF_S * (2 ** (i - 1)))
+        if cafef_last_exc is not None:
             source_exc_count += 1
-            _write_ticker_exception_debug(ticker=ticker, exc=exc, phase="source_cafef_requests")
+            _write_ticker_exception_debug(ticker=ticker, exc=cafef_last_exc, phase="source_cafef_requests")
             _write_ocr_debug_event(
                 ticker=ticker,
                 source_tag="cafef_requests",
                 url="",
-                event={"status": "source_exception", "exception_type": type(exc).__name__, "message": str(exc)},
+                event={"status": "source_exception", "exception_type": type(cafef_last_exc).__name__, "message": str(cafef_last_exc)},
             )
         records_by_source["cafef_requests"] = rec1 or []
         rec_vs: list[dict[str, Any]] = []
@@ -1605,8 +2029,22 @@ def run_pilot(
                 event={"status": "source_exception", "exception_type": type(exc).__name__, "message": str(exc)},
             )
         records_by_source["vietstock_financeinfo"] = rec_vs or []
+        rec_vci: list[dict[str, Any]] = []
+        try:
+            rec_vci = fetch_from_vci_financial_api(ticker)
+        except Exception as exc:
+            source_exc_count += 1
+            _write_ticker_exception_debug(ticker=ticker, exc=exc, phase="source_vci_financial_api")
+            _write_ocr_debug_event(
+                ticker=ticker,
+                source_tag="vci_financial_api",
+                url="",
+                event={"status": "source_exception", "exception_type": type(exc).__name__, "message": str(exc)},
+            )
+        records_by_source["vci_financial_api"] = rec_vci or []
         rec_doc: list[dict[str, Any]] = []
-        if allow_ocr_source or _ocr_debug_allowed_for_ticker(ticker):
+        ocr_selected = (not OCR_SOURCE_TICKERS) or (ticker.upper() in OCR_SOURCE_TICKERS)
+        if (allow_ocr_source and ocr_selected) or _ocr_debug_allowed_for_ticker(ticker):
             try:
                 rec_doc, doc_files = fetch_from_vietstock_bctc_documents(
                     ticker=ticker,
@@ -1628,12 +2066,16 @@ def run_pilot(
                     event={"status": "source_exception", "exception_type": type(exc).__name__, "message": str(exc)},
                 )
         else:
-            source_stats["ocr_source_disabled"] += 1
+            if not allow_ocr_source:
+                source_stats["ocr_source_disabled"] += 1
+            else:
+                source_stats["ocr_source_not_selected"] += 1
         records_by_source["vietstock_bctc_documents"] = rec_doc or []
         rec2 = []
         if (
             not records_by_source["cafef_requests"]
             and not records_by_source["vietstock_financeinfo"]
+            and not records_by_source["vci_financial_api"]
             and not records_by_source["vietstock_bctc_documents"]
         ):
             try:
@@ -1651,8 +2093,8 @@ def run_pilot(
         merged = _merge_source_records(records_by_source, trusted_only=not allow_ocr_source)
         return ticker, records_by_source, merged, doc_files, source_exc_count
 
-    max_workers = min(8, max(len(tickers), 1))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    worker_count = max(1, min(int(max_workers), max(len(tickers), 1)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {executor.submit(_process_ticker, t): t for t in tickers}
         done = 0
         for future in as_completed(future_map):
@@ -1666,6 +2108,7 @@ def run_pilot(
                 records_by_source = {
                     "cafef_requests": [],
                     "vietstock_financeinfo": [],
+                    "vci_financial_api": [],
                     "vietstock_bctc_documents": [],
                     "cafef_cloudscraper": [],
                 }
@@ -1675,6 +2118,7 @@ def run_pilot(
             source_stats["source_exceptions"] += source_exc_count
             source_stats["cafef_requests_records"] += len(records_by_source["cafef_requests"])
             source_stats["vietstock_financeinfo_records"] += len(records_by_source["vietstock_financeinfo"])
+            source_stats["vci_financial_api_records"] += len(records_by_source["vci_financial_api"])
             source_stats["vietstock_bctc_document_records"] += len(records_by_source["vietstock_bctc_documents"])
             source_stats["cafef_cloudscraper_records"] += len(records_by_source["cafef_cloudscraper"])
             source_stats["vietstock_doc_files"] += len(doc_files)
@@ -1744,6 +2188,7 @@ def run_pilot(
         "fill_rate_after_pct": after["fill_rate_pct"],
         "fill_rate_gain_pct_point": round(after["fill_rate_pct"] - before["fill_rate_pct"], 2),
         "source_stats": source_stats,
+        "bi_priority_fill_csv": paths["bi_priority_csv"],
         "report_json": paths["json"],
         "column_delta_csv": paths["csv"],
         "document_inventory_csv": paths["doc_csv"],
@@ -1762,6 +2207,10 @@ def run_pilot(
         "ocr_debug_tickers": sorted(list(OCR_DEBUG_TICKERS)),
         "ocr_debug_max_lines": OCR_DEBUG_MAX_LINES,
         "ocr_debug_max_files_per_ticker": OCR_DEBUG_MAX_FILES_PER_TICKER,
+        "ocr_source_tickers": sorted(list(OCR_SOURCE_TICKERS)),
+        "ocr_source_top_missing": max(int(ocr_source_top_missing or 0), 0),
+        "max_workers": worker_count,
+        "exclude_tickers": excluded_tickers_list,
         "db_available": db_available,
     }
 
@@ -1826,7 +2275,7 @@ def main() -> None:
     parser.add_argument(
         "--new-key-allowed-sources",
         type=str,
-        default="vietstock_bctc_documents,vietstock_financeinfo",
+        default="vietstock_bctc_documents,vietstock_financeinfo,vci_financial_api",
         help="Comma-separated sources allowed for new key insertion.",
     )
     parser.add_argument(
@@ -1857,6 +2306,30 @@ def main() -> None:
         default=2,
         help="Max document files to parse per debug ticker during OCR debug.",
     )
+    parser.add_argument(
+        "--ocr-source-tickers",
+        type=str,
+        default="",
+        help="Comma-separated tickers to enable OCR/document source for. Empty means all tickers unless --ocr-source-top-missing is set.",
+    )
+    parser.add_argument(
+        "--ocr-source-top-missing",
+        type=int,
+        default=0,
+        help="Auto-select top N tickers with highest missing rate on BI-priority columns for OCR/document source.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Max parallel workers for ticker processing.",
+    )
+    parser.add_argument(
+        "--exclude-tickers",
+        type=str,
+        default="",
+        help="Comma-separated tickers to exclude from pilot selection.",
+    )
     args = parser.parse_args()
 
     result = run_pilot(
@@ -1877,6 +2350,10 @@ def main() -> None:
         ocr_debug_tickers=args.ocr_debug_tickers,
         ocr_debug_max_lines=max(args.ocr_debug_max_lines, 10),
         ocr_debug_max_files_per_ticker=max(args.ocr_debug_max_files_per_ticker, 1),
+        ocr_source_tickers=args.ocr_source_tickers,
+        ocr_source_top_missing=max(args.ocr_source_top_missing, 0),
+        max_workers=max(args.max_workers, 1),
+        exclude_tickers=args.exclude_tickers,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

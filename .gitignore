@@ -19,9 +19,11 @@ env/
 etl/dead_letter/
 tmp_*
 scripts/output/
+scripts/logs/
 logs/
 
-# Root-level accidental artifacts (do not commit)
+# Accidental root-level artifacts
+/merged
 /debug_api.py
 /git
 /main

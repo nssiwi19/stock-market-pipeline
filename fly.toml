@@ -1,0 +1,12 @@
+app = "stock-qa-bot-vn-999"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+  PYTHONPATH = "/app"
+
+# Vì đây là Bot Long-polling (không mở port HTTP API), 
+# chúng ta không cấu hình [http_service] để tránh bị Fly.io check health-check thất bại.

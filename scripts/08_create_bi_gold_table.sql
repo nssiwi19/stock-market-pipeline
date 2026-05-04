@@ -427,3 +427,101 @@ $$;
 
 -- First refresh
 select public.refresh_financial_reports_bi_gold();
+
+-- Chart-safe views: use these in BI to avoid null-heavy/low-quality rows.
+create or replace view public.financial_reports_bi_gold_revenue_ready as
+select *
+from public.financial_reports_bi_gold
+where report_type = 'yearly'
+  and is_latest_yearly = true
+  and bi_ready_revenue = true
+  and revenue is not null
+  and revenue >= 0;
+
+create or replace view public.financial_reports_bi_gold_profit_ready as
+select *
+from public.financial_reports_bi_gold
+where report_type = 'yearly'
+  and is_latest_yearly = true
+  and bi_ready_profit = true
+  and profit_after_tax is not null;
+
+create or replace view public.financial_reports_bi_gold_liquidity_ready as
+select *
+from public.financial_reports_bi_gold
+where report_type = 'yearly'
+  and is_latest_yearly = true
+  and current_ratio is not null
+  and current_ratio > 0
+  and current_ratio <= 100;
+
+-- Universal chart-safe base: latest yearly rows with decent quality.
+create or replace view public.financial_reports_bi_gold_latest_ready as
+select *
+from public.financial_reports_bi_gold
+where report_type = 'yearly'
+  and is_latest_yearly = true
+  and source_tier <> 'rejected'
+  and quality_score >= 75;
+
+-- Universal metric view (long format) for BI:
+-- - one row = one metric value
+-- - excludes null values to prevent null distortion in charts
+create or replace view public.financial_reports_bi_gold_metrics_ready as
+with latest as (
+  select *
+  from public.financial_reports_bi_gold_latest_ready
+)
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'revenue'::text as metric_name, revenue::numeric as metric_value
+from latest where revenue is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'cogs'::text, cogs::numeric
+from latest where cogs is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'gross_profit'::text, gross_profit::numeric
+from latest where gross_profit is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'operating_profit'::text, operating_profit::numeric
+from latest where operating_profit is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'profit_before_tax'::text, profit_before_tax::numeric
+from latest where profit_before_tax is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'profit_after_tax'::text, profit_after_tax::numeric
+from latest where profit_after_tax is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'eps'::text, eps::numeric
+from latest where eps is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'total_assets'::text, total_assets::numeric
+from latest where total_assets is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'total_liabilities'::text, total_liabilities::numeric
+from latest where total_liabilities is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'equity'::text, equity::numeric
+from latest where equity is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'gross_margin'::text, gross_margin::numeric
+from latest where gross_margin is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'operating_margin'::text, operating_margin::numeric
+from latest where operating_margin is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'net_margin'::text, net_margin::numeric
+from latest where net_margin is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'roe'::text, roe::numeric
+from latest where roe is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'roa'::text, roa::numeric
+from latest where roa is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'debt_to_equity'::text, debt_to_equity::numeric
+from latest where debt_to_equity is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'current_ratio'::text, current_ratio::numeric
+from latest where current_ratio is not null
+union all
+select ticker, industry, industry_normalized, period, period_year, source, source_tier, quality_score, 'asset_turnover'::text, asset_turnover::numeric
+from latest where asset_turnover is not null;
